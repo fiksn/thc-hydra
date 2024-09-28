@@ -980,19 +980,6 @@ int32_t start_http_form(int32_t s, char *ip, int32_t port, unsigned char options
     found = success_cond;
   }
 
-  if (auth_flag) { // we received a 401 error - user may be using wrong module
-    if (code_401_is_failure) { // apparently they don't think so  -- treat 401 as failure
-      hydra_completed_pair();
-      return 1;
-    } else {
-      hydra_report(stderr,
-                   "[ERROR] received HTTP error code 401. The target may be using HTTP auth, "
-                   "not a web form.  Use module \"http%s-get\" instead, or set \"1=\".\n",
-                   (options & OPTION_SSL) > 0 ? "s" : "");
-      return 2;
-    }
-  }
-
   if (strlen(cookie) > 0)
     process_cookies(&ptr_cookie, cookie);
 

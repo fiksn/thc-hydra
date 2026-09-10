@@ -36,14 +36,18 @@ extern int32_t internal__hydra_recv(int32_t socket, char *buf, int32_t length);
 extern int32_t hydra_data_ready_timed(int32_t socket, long sec, long usec);
 
 extern hydra_option hydra_options;
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 char mysqlsalt[9];
 
 /* modified hydra_receive_line, I've striped code which changed every 0x00 to
- * 0x20 */
-char *hydra_mysql_receive_line(int32_t socket) {
+ * 0x20. out_len, if non-NULL, receives the number of bytes actually read into
+ * the returned buffer (the buffer may contain embedded NULs). */
+char *hydra_mysql_receive_line(int32_t socket, int32_t *out_len) {
   char buf[300], *buff, *buff2;
   int32_t i = 0, j = 0, buff_size = 300;
+
+  if (out_len != NULL)
+    *out_len = 0;
 
   buff = malloc(buff_size);
   if (buff == NULL)
@@ -82,6 +86,8 @@ char *hydra_mysql_receive_line(int32_t socket) {
 
   if (debug)
     hydra_report_debug(stderr, "DEBUG_RECV_BEGIN|%s|END\n", buff);
+  if (out_len != NULL)
+    *out_len = i;
   return buff;
 }
 
@@ -89,16 +95,25 @@ char *hydra_mysql_receive_line(int32_t socket) {
 char hydra_mysql_init(int32_t sock) {
   char *server_version, *pos, *buf;
   unsigned char protocol;
+  int32_t buf_len = 0;
+  int32_t ver_max, ver_len;
 
-  buf = hydra_mysql_receive_line(sock);
+  buf = hydra_mysql_receive_line(sock, &buf_len);
   if (buf == NULL)
     return 1;
 
+  /* greeting must contain at least: 4 byte header + 1 byte protocol */
+  if (buf_len < 5) {
+    free(buf);
+    return 2;
+  }
+
   protocol = buf[4];
   if (protocol == 0xff) {
-    pos = &buf[6];
-    //    *(strchr(pos, '.')) = '\0';
-    hydra_report(stderr, "[ERROR] %s\n", pos);
+    if (buf_len > 6) {
+      pos = &buf[6];
+      hydra_report(stderr, "[ERROR] %s\n", pos);
+    }
     free(buf);
     return 2;
   }
@@ -112,8 +127,24 @@ char hydra_mysql_init(int32_t sock) {
             "sure if it will work\n",
             protocol);
   }
+
+  /* layout after byte 5: NUL-terminated version string, then 4 byte thread id,
+   * then 8 byte salt + 1 NUL (the +10 below). Bound the strlen() to the buffer
+   * size and require enough trailing bytes for the 9-byte salt copy. */
+  if (buf_len <= 5) {
+    free(buf);
+    return 2;
+  }
   server_version = &buf[5];
-  pos = buf + strlen(server_version) + 10;
+  ver_max = buf_len - 5;
+  ver_len = (int32_t)strnlen(server_version, (size_t)ver_max);
+  if (ver_len >= ver_max || 5 + ver_len + 10 + 9 > buf_len) {
+    if (verbose || debug)
+      hydra_report(stderr, "[ERROR] MySQL greeting truncated or malformed\n");
+    free(buf);
+    return 2;
+  }
+  pos = buf + 5 + ver_len + 10;
   memcpy(mysqlsalt, pos, 9);
 
   if (!strstr(server_version, "3.") && !strstr(server_version, "4.") && strstr(server_version, "5.")) {
@@ -158,15 +189,17 @@ char *hydra_mysql_prepare_auth(char *login, char *pass) {
 
 /* and 1 if failed                     */
 char hydra_mysql_parse_response(unsigned char *response) {
-  unsigned long response_len = *((unsigned long *)response) & 0xffffff;
+  /* require an OK packet header (response[4] == 0x00) with a non-zero payload;
+   * read response_len byte-wise to avoid UB from an unaligned 32-bit load. */
+  unsigned long response_len = ((unsigned long)response[0])
+                              | ((unsigned long)response[1] << 8)
+                              | ((unsigned long)response[2] << 16);
 
-  if (response_len < 4)
-    return 0;
-
-  if (response[4] == 0xff)
+  if (response_len < 1)
     return 1;
-
-  return 0;
+  if (response[4] == 0x00)
+    return 0;
+  return 1;
 }
 
 char hydra_mysql_send_com_quit(int32_t sock) {
@@ -180,13 +213,17 @@ int32_t start_mysql(int32_t sock, char *ip, int32_t port, unsigned char options,
   char *response = NULL, *login = NULL, *pass = NULL;
   unsigned long response_len;
   char res = 0;
+#ifdef LIBMYSQLCLIENT
   char *database = NULL;
+#endif
 
   login = hydra_get_next_login();
   pass = hydra_get_next_password();
 
+#ifdef LIBMYSQLCLIENT
   if (miscptr)
     database = miscptr;
+#endif
 
   /* read server greeting */
   res = hydra_mysql_init(sock);
@@ -279,7 +316,7 @@ int32_t start_mysql(int32_t sock, char *ip, int32_t port, unsigned char options,
   free(response);
 
   /* read authentication response */
-  if ((response = hydra_mysql_receive_line(sock)) == NULL)
+  if ((response = hydra_mysql_receive_line(sock, NULL)) == NULL)
     return 1;
   res = hydra_mysql_parse_response((unsigned char *)response);
 

@@ -1,6 +1,6 @@
 #include "hydra-mod.h"
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 char *buf;
 
 int32_t start_ftp(int32_t s, char *ip, int32_t port, unsigned char options, char *miscptr, FILE *fp) {
@@ -26,8 +26,10 @@ int32_t start_ftp(int32_t s, char *ip, int32_t port, unsigned char options, char
     if (verbose)
       printf("[INFO] user %s does not exist, skipping\n", login);
     hydra_completed_pair_skip();
-    if (memcmp(hydra_get_next_pair(), &HYDRA_EXIT, sizeof(HYDRA_EXIT)) == 0)
+    if (memcmp(hydra_get_next_pair(), &HYDRA_EXIT, sizeof(HYDRA_EXIT)) == 0) {
+      free(buf);
       return 4;
+    }
     free(buf);
     return 1;
   }
@@ -35,8 +37,10 @@ int32_t start_ftp(int32_t s, char *ip, int32_t port, unsigned char options, char
   if (buf[0] == '2') {
     hydra_report_found_host(port, ip, "ftp", fp);
     hydra_completed_pair_found();
-    if (memcmp(hydra_get_next_pair(), &HYDRA_EXIT, sizeof(HYDRA_EXIT)) == 0)
+    if (memcmp(hydra_get_next_pair(), &HYDRA_EXIT, sizeof(HYDRA_EXIT)) == 0) {
+      free(buf);
       return 4;
+    }
     free(buf);
     return 1;
   }
@@ -61,8 +65,10 @@ int32_t start_ftp(int32_t s, char *ip, int32_t port, unsigned char options, char
   if (buf[0] == '2') {
     hydra_report_found_host(port, ip, "ftp", fp);
     hydra_completed_pair_found();
-    if (memcmp(hydra_get_next_pair(), &HYDRA_EXIT, sizeof(HYDRA_EXIT)) == 0)
+    if (memcmp(hydra_get_next_pair(), &HYDRA_EXIT, sizeof(HYDRA_EXIT)) == 0) {
+      free(buf);
       return 4;
+    }
     free(buf);
     return 1;
   }

@@ -28,7 +28,7 @@
 #include <string.h>
 
 extern hydra_option hydra_options;
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 
 typedef struct creds {
   const char *workgroup;
@@ -136,6 +136,7 @@ bool smb2_run_test(creds_t *cr, const char *server, uint16_t port) {
     // Noticed this when connecting to older samba servers on linux
     // where any credentials are accepted.
     hydra_report(stderr, "[WARNING] %s might accept any credential\n", server);
+    /* fall through */
   case EINVAL: // 22
     // probably password ok, nominal case when connecting to a windows
     // smb server with good credentials.

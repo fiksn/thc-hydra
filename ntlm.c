@@ -223,7 +223,7 @@ it also defines lots of intermediate macros, just ignore those :-)
 
 #define SVAL(buf, pos) (PVAL(buf, pos) | PVAL(buf, (pos) + 1) << 8)
 #define IVAL(buf, pos) (SVAL(buf, pos) | SVAL(buf, (pos) + 2) << 16)
-#define SSVALX(buf, pos, val) (CVAL(buf, pos) = (val)&0xFF, CVAL(buf, pos + 1) = (val) >> 8)
+#define SSVALX(buf, pos, val) (CVAL(buf, pos) = (val) & 0xFF, CVAL(buf, pos + 1) = (val) >> 8)
 #define SIVALX(buf, pos, val) (SSVALX(buf, pos, val & 0xFFFF), SSVALX(buf, pos + 2, val >> 16))
 #define SVALS(buf, pos) ((int16)SVAL(buf, pos))
 #define IVALS(buf, pos) ((int32)IVAL(buf, pos))
@@ -262,14 +262,14 @@ it also defines lots of intermediate macros, just ignore those :-)
   {                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            \
     int32_t l;                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 \
     for (l = 0; l < (len); l++)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                \
-      (val)[l] = macro((buf), (pos) + (size)*l);                                                                                                                                                                                                                                                                                                                                                                                                                                                                               \
+      (val)[l] = macro((buf), (pos) + (size) * l);                                                                                                                                                                                                                                                                                                                                                                                                                                                                             \
   }
 
 #define SSMBMACRO(macro, buf, pos, val, len, size)                                                                                                                                                                                                                                                                                                                                                                                                                                                                             \
   {                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            \
     int32_t l;                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 \
     for (l = 0; l < (len); l++)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                \
-      macro((buf), (pos) + (size)*l, (val)[l]);                                                                                                                                                                                                                                                                                                                                                                                                                                                                                \
+      macro((buf), (pos) + (size) * l, (val)[l]);                                                                                                                                                                                                                                                                                                                                                                                                                                                                              \
   }
 
 /* reads multiple data from an SMB buffer */
@@ -289,7 +289,7 @@ it also defines lots of intermediate macros, just ignore those :-)
 #define PSIVALS(buf, pos, val, len) SSMBMACRO(SIVALS, buf, pos, val, len, 4)
 
 /* now the reverse routines - these are used in nmb packets (mostly) */
-#define SREV(x) ((((x)&0xFF) << 8) | (((x) >> 8) & 0xFF))
+#define SREV(x) ((((x) & 0xFF) << 8) | (((x) >> 8) & 0xFF))
 #define IREV(x) ((SREV(x) << 16) | (SREV((x) >> 16)))
 
 #define RSVAL(buf, pos) SREV(SVAL(buf, pos))
@@ -1109,9 +1109,13 @@ Contributed LGPL versions of some of the GPL'd Samba files.
  * in the structures probably needs to be designed
  */
 
+/* Callers cast a 4096-byte stack buffer onto these structs; refuse writes
+ * past the struct's declared 1024-byte buffer to prevent server-driven
+ * overflow when uDomain/uUser/uWks etc. are very long. */
+#define NTLM_BUF_MAX 1024
 #define AddBytes(ptr, header, buf, count)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      \
   {                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            \
-    if (buf != NULL && count != 0) {                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           \
+    if (buf != NULL && count != 0 && (uint32_t)(count) <= (uint32_t)NTLM_BUF_MAX && ptr->bufIndex <= (uint32_t)(NTLM_BUF_MAX - (count))) {                                                                                                                                                                                                                                                                                                                                                                                     \
       SSVAL(&ptr->header.len, 0, count);                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       \
       SSVAL(&ptr->header.maxlen, 0, count);                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    \
       SIVAL(&ptr->header.offset, 0, ((ptr->buffer - ((uint8 *)ptr)) + ptr->bufIndex));                                                                                                                                                                                                                                                                                                                                                                                                                                         \
@@ -1132,6 +1136,8 @@ Contributed LGPL versions of some of the GPL'd Samba files.
     AddBytes(ptr, header, ((unsigned char *)p), len);                                                                                                                                                                                                                                                                                                                                                                                                                                                                          \
   }
 
+/* Keep `len` in sync with the internal cap inside strToUnicode so that
+ * AddBytes does not memcpy past the bytes strToUnicode actually wrote. */
 #define AddUnicodeString(ptr, header, string)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  \
   {                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            \
     char *p = string;                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          \
@@ -1139,14 +1145,31 @@ Contributed LGPL versions of some of the GPL'd Samba files.
     int32_t len = 0;                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           \
     if (p) {                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   \
       len = strlen(p);                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         \
+      if (len > NTLM_BUF_MAX / 2)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              \
+        len = NTLM_BUF_MAX / 2;                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                \
       b = strToUnicode(p);                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     \
     }                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          \
     AddBytes(ptr, header, b, len * 2);                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         \
   }
 
-#define GetUnicodeString(structPtr, header) unicodeToString(((char *)structPtr) + IVAL(&structPtr->header.offset, 0), SVAL(&structPtr->header.len, 0) / 2)
-#define GetString(structPtr, header) toString((((char *)structPtr) + IVAL(&structPtr->header.offset, 0)), SVAL(&structPtr->header.len, 0))
-#define DumpBuffer(fp, structPtr, header) dumpRaw(fp, ((unsigned char *)structPtr) + IVAL(&structPtr->header.offset, 0), SVAL(&structPtr->header.len, 0))
+/* All callers in this codebase decode the Type 2 challenge into a 4096-byte
+ * buf, so any embedded offset+len pointing past that is server-driven OOB. */
+#define NTLM_MAX_CHALLENGE 4096
+#define NTLM_OFFSET_OK(structPtr, header, scale)                                                                                                                                                                                                                                                                                                                                                                                                                                                                              \
+  ((uint64_t)IVAL(&structPtr->header.offset, 0) + (uint64_t)SVAL(&structPtr->header.len, 0) <= (uint64_t)NTLM_MAX_CHALLENGE)
+#define GetUnicodeString(structPtr, header)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    \
+  (NTLM_OFFSET_OK(structPtr, header, 1)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        \
+       ? unicodeToString(((char *)structPtr) + IVAL(&structPtr->header.offset, 0), SVAL(&structPtr->header.len, 0) / 2)                                                                                                                                                                                                                                                                                                                                                                                                        \
+       : (char *)"")
+#define GetString(structPtr, header)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           \
+  (NTLM_OFFSET_OK(structPtr, header, 1)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        \
+       ? toString((((char *)structPtr) + IVAL(&structPtr->header.offset, 0)), SVAL(&structPtr->header.len, 0))                                                                                                                                                                                                                                                                                                                                                                                                                 \
+       : (unsigned char *)"")
+#define DumpBuffer(fp, structPtr, header)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      \
+  do {                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         \
+    if (NTLM_OFFSET_OK(structPtr, header, 1))                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  \
+      dumpRaw(fp, ((unsigned char *)structPtr) + IVAL(&structPtr->header.offset, 0), SVAL(&structPtr->header.len, 0));                                                                                                                                                                                                                                                                                                                                                                                                         \
+  } while (0)
 
 static void dumpRaw(FILE *fp, unsigned char *buf, size_t len) {
   int32_t i;
@@ -1161,7 +1184,9 @@ static char *unicodeToString(char *p, size_t len) {
   int32_t i;
   static char buf[4096];
 
-  assert(len + 1 < sizeof buf);
+  /* runtime bound: assert() is a no-op under -DNDEBUG. */
+  if (len + 1 >= sizeof buf)
+    len = sizeof buf - 1;
 
   for (i = 0; i < (int32_t)len; ++i) {
     buf[i] = *p & 0x7f;
@@ -1177,8 +1202,12 @@ static unsigned char *strToUnicode(char *p) {
   size_t l = strlen(p);
   int32_t i = 0;
 
-  assert(l * 2 < sizeof buf);
+  if (l * 2 >= sizeof buf)
+    l = (sizeof buf - 1) / 2;
 
+  /* Clear stale bytes from a prior call so a server-controlled length cannot
+   * make the caller transmit content from a previous credential attempt. */
+  memset(buf, 0, sizeof buf);
   while (l--) {
     buf[i++] = *p++;
     buf[i++] = 0;
@@ -1190,7 +1219,8 @@ static unsigned char *strToUnicode(char *p) {
 static unsigned char *toString(char *p, size_t len) {
   static unsigned char buf[4096];
 
-  assert(len + 1 < sizeof buf);
+  if (len + 1 >= sizeof buf)
+    len = sizeof buf - 1;
 
   memcpy(buf, p, len);
   buf[len] = 0;
@@ -1222,10 +1252,12 @@ void buildAuthRequest(tSmbNtlmAuthRequest *request, long flags, char *host, char
   SIVAL(&request->msgType, 0, 1);
   SIVAL(&request->flags, 0, flags);
 
-  assert(strlen(host) < 128);
+  /* Runtime caps: assert is a no-op under -DNDEBUG. */
+  if (host != NULL && strlen(h) >= 128)
+    h[127] = '\0';
   AddString(request, host, h);
-  assert(strlen(domain) < 128);
-  AddString(request, domain, domain);
+  if (domain != NULL && strlen(domain) < 128)
+    AddString(request, domain, domain);
   free(h);
 }
 
@@ -1260,11 +1292,16 @@ void buildAuthResponse(tSmbNtlmAuthChallenge *challenge, tSmbNtlmAuthResponse *r
   AddBytes(response, lmResponse, lmRespData, 24);
   AddBytes(response, ntResponse, ntRespData, 24);
 
-  assert(strlen(domain) < 128);
+  /* Runtime caps: assert is a no-op under -DNDEBUG. Domain comes from the
+   * server-controlled challenge; user/host come from operator argv. */
+  if (domain != NULL && strlen(domain) >= 128)
+    domain[127] = '\0';
   AddUnicodeString(response, uDomain, domain);
-  assert(strlen(u) < 128);
+  if (u != NULL && strlen(u) >= 128)
+    u[127] = '\0';
   AddUnicodeString(response, uUser, u);
-  assert(strlen(w) < 128);
+  if (w != NULL && strlen(w) >= 128)
+    w[127] = '\0';
   AddUnicodeString(response, uWks, w);
 
   AddString(response, sessionKey, NULL);
@@ -1369,12 +1406,16 @@ void to64frombits(unsigned char *out, const unsigned char *in, int32_t inlen)
   *out = '\0';
 }
 
-int32_t from64tobits(char *out, const char *in)
-
-/* base 64 to raw bytes in quasi-big-endian order, returning count of bytes */
+/* base 64 to raw bytes in quasi-big-endian order. outlen is the size of the
+ * out buffer; decoding stops without writing past out[outlen-1] and returns -1
+ * if the input would have produced more than outlen bytes. */
+int32_t from64tobits_n(char *out, const char *in, int32_t outlen)
 {
   int32_t len = 0;
   register unsigned char digit1, digit2, digit3, digit4;
+
+  if (outlen <= 0)
+    return (-1);
 
   if (in[0] == '+' && in[1] == ' ')
     in += 2;
@@ -1395,12 +1436,18 @@ int32_t from64tobits(char *out, const char *in)
     if (digit4 != '=' && DECODE64(digit4) == BAD)
       return (-1);
     in += 4;
+    if (len >= outlen)
+      return (-1);
     *out++ = (DECODE64(digit1) << 2) | (DECODE64(digit2) >> 4);
     ++len;
     if (digit3 != '=') {
+      if (len >= outlen)
+        return (-1);
       *out++ = ((DECODE64(digit2) << 4) & 0xf0) | (DECODE64(digit3) >> 2);
       ++len;
       if (digit4 != '=') {
+        if (len >= outlen)
+          return (-1);
         *out++ = ((DECODE64(digit3) << 6) & 0xc0) | DECODE64(digit4);
         ++len;
       }
@@ -1408,6 +1455,12 @@ int32_t from64tobits(char *out, const char *in)
   } while (*in && *in != '\r' && digit4 != '=');
 
   return (len);
+}
+
+/* legacy unbounded wrapper; new code should use from64tobits_n() */
+int32_t from64tobits(char *out, const char *in)
+{
+  return from64tobits_n(out, in, INT32_MAX);
 }
 
 /* base64.c ends here */

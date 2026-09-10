@@ -18,7 +18,7 @@
 int32_t vnc_client_version = RFB33;
 int32_t failed_auth = 0;
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 static char *buf;
 
 /*
@@ -52,7 +52,11 @@ int32_t start_vnc(int32_t s, char *ip, int32_t port, unsigned char options, char
   if (strlen(pass = hydra_get_next_password()) == 0)
     pass = empty;
 
-  recv(s, buf2, CHALLENGESIZE + 4, 0);
+  memset(buf2, 0, sizeof(buf2));
+  if (recv(s, buf2, CHALLENGESIZE + 4, 0) < CHALLENGESIZE + 4) {
+    hydra_report(stderr, "[ERROR] VNC server connection failed (short read)\n");
+    hydra_child_exit(0);
+  }
 
   if (vnc_client_version == RFB37) {
     int32_t i;
@@ -63,7 +67,7 @@ int32_t start_vnc(int32_t s, char *ip, int32_t port, unsigned char options, char
       hydra_child_exit(0);
     }
 
-    for (i = 1; i <= buf2[0]; i++) {
+    for (i = 1; i < buf2[0] && i < (int32_t)sizeof(buf2); i++) {
       // fprintf(stderr,"sec type %u\n",buf2[i]);
       // check if weak security types are available
       if (buf2[i] <= 0x2) {
@@ -114,10 +118,12 @@ int32_t start_vnc(int32_t s, char *ip, int32_t port, unsigned char options, char
     hydra_child_exit(2);
   }
 
-  // check security result value
-  recv(s, buf, 4, 0);
-  if (buf == NULL)
-    return 1;
+  // check security result value: require all 4 bytes before classifying.
+  {
+    int32_t r = (int32_t)recv(s, buf, 4, 0);
+    if (r < 4)
+      return 1;
+  }
 
   switch (buf[3]) {
   case 0x0:

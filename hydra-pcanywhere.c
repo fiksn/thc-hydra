@@ -6,23 +6,28 @@
 
 #include "hydra-mod.h"
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 
 int32_t pcadebug = 0;
 
 int32_t send_cstring(int32_t s, char *crypted_string) {
-  char buffer2[100], *bptr = buffer2;
-  char clientcryptheader[] = "\x06";
+  /* Sized to fit the upstream caps: clogin/cpass are CSLEN-bounded (128),
+   * plus the 2-byte header, plus a NUL. */
+  char buffer2[2 + 128 + 1];
+  size_t len;
 
-  memset(buffer2, 0, sizeof(clientcryptheader));
-  bptr = buffer2;
+  if (crypted_string == NULL)
+    return -1;
+  len = strlen(crypted_string);
+  if (len > sizeof(buffer2) - 3)
+    return -1;
+
+  memset(buffer2, 0, sizeof(buffer2));
   buffer2[0] = 6;
-  bptr++;
-  buffer2[1] = strlen(crypted_string);
-  bptr++;
-  strcpy(bptr, crypted_string);
+  buffer2[1] = (unsigned char)len;
+  memcpy(buffer2 + 2, crypted_string, len);
 
-  return hydra_send(s, buffer2, 2 + strlen(crypted_string), 0);
+  return hydra_send(s, buffer2, 2 + (int32_t)len, 0);
 }
 
 void show_buffer(char *buffer, int32_t size) {
@@ -127,8 +132,14 @@ int32_t start_pcanywhere(int32_t s, char *ip, int32_t port, unsigned char option
 
   /*printf("testing %s:%s\n",login,pass); */
 
-  strcpy(clogin, login);
-  strcpy(cpass, pass);
+  if (strlen(login) >= sizeof(clogin) || strlen(pass) >= sizeof(cpass)) {
+    hydra_completed_pair_skip();
+    return 1;
+  }
+  strncpy(clogin, login, sizeof(clogin) - 1);
+  clogin[sizeof(clogin) - 1] = 0;
+  strncpy(cpass, pass, sizeof(cpass) - 1);
+  cpass[sizeof(cpass) - 1] = 0;
 
   pca_encrypt(clogin);
   pca_encrypt(cpass);
@@ -196,11 +207,10 @@ int32_t start_pcanywhere(int32_t s, char *ip, int32_t port, unsigned char option
     return 1;
   }
 
-  ret = hydra_recv(s, buffer, sizeof(buffer));
+  ret = hydra_recv(s, buffer, sizeof(buffer) - 1);
   if (ret < 0)
     return 1;
-  else
-    buffer[ret] = 0;
+  buffer[ret] = 0;
 
   clean_buffer(buffer, ret);
   /*show_buffer(buffer,ret); */

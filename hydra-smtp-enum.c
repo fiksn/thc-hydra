@@ -13,7 +13,7 @@ passwd will be used as the domain name
 
 #include "hydra-mod.h"
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 char *buf;
 char *err = NULL;
 int32_t tosent = 0;
@@ -120,12 +120,12 @@ int32_t start_smtp_enum(int32_t s, char *ip, int32_t port, unsigned char options
   if (err || tosent || strncmp(buf, "50", 2) == 0) {
     // we should report command not identified by the server
     // 502 5.5.2 Error: command not recognized
-    //#ifdef HAVE_PCRE
+    // #ifdef HAVE_PCRE
     //    if ((debug || hydra_string_match(buf,
     //    "\\scommand\\snot\\srecognized")) && err) {
-    //#else
+    // #else
     //    if ((debug || strstr(buf, "command") != NULL) && err) {
-    //#endif
+    // #endif
     //      hydra_report(stderr, "Server %s", err);
     //    }
     if (strncmp(buf, "500 ", 4) == 0 || strncmp(buf, "502 ", 4) == 0) {

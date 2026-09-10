@@ -2,25 +2,30 @@
 // Tested on mongodb-server 1:3.6.3-0ubuntu1
 // MONGODB-CR is been deprecated
 
+#ifdef LIBMONGODB2
+#include <mongoc/mongoc.h>
+#endif
 #ifdef LIBMONGODB
 #include <mongoc.h>
 #endif
 
 #include "hydra-mod.h"
 
-#ifndef LIBMONGODB
+#if !defined(LIBMONGODB2) && !defined(LIBMONGODB)
 void dummy_mongodb() { printf("\n"); }
 #else
 
 extern int32_t hydra_data_ready_timed(int32_t socket, long sec, long usec);
 
 extern hydra_option hydra_options;
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 char *buf;
 
 #define DEFAULT_DB "admin"
 
 int is_error_msg(char *msg) {
+  if (msg == NULL)
+    return 0;
   if (strstr(msg, "errmsg ")) {
     if (debug)
       hydra_report(stderr, "[ERROR] %s\n", msg);

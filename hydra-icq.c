@@ -1,6 +1,6 @@
 #include "hydra-mod.h"
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 extern int32_t child_head_no;
 int32_t seq = 1;
 
@@ -12,7 +12,6 @@ const unsigned char icq5_table[] = {0x59, 0x60, 0x37, 0x6B, 0x65, 0x62, 0x46, 0x
 void fix_packet(char *buf, int32_t len) {
   unsigned long c1, c2;
   unsigned long r1, r2;
-  int32_t pos, key, k;
 
   c1 = buf[8];
   c1 <<= 8;
@@ -39,13 +38,6 @@ void fix_packet(char *buf, int32_t len) {
   buf[0x15] = (c1 >> 8) & 0xff;
   buf[0x16] = (c1 >> 16) & 0xff;
   buf[0x17] = (c1 >> 24) & 0xff;
-
-  key = len * 0x68656c6cL;
-  key += c1;
-  pos = 0xa;
-
-  for (; pos < len; pos += 4)
-    k = key + icq5_table[pos & 0xff];
 }
 
 void icq_header(char *buf, unsigned short cmd, unsigned long uin) {
@@ -70,6 +62,12 @@ int32_t icq_login(int32_t s, char *login, char *pass) {
 
   icq_header(buf, 0x03e8, uin);
   len = strlen(pass) + 1;
+  /* buf[14] is a single-byte length field; the highest write below is
+   * buf[41 + len]. */
+  if (len > 255 || len + 42 >= (int32_t)sizeof(buf)) {
+    hydra_completed_pair_skip();
+    return -1;
+  }
   buf[14] = len;
   memcpy(&buf[16], pass, len);
   buf[16 + len] = 0x78;

@@ -75,14 +75,20 @@ refresh ()
     
   for SUBSITE in `cat $SUBSITES`; do
     VENDOR=`echo $SUBSITE | sed 's/\.htm*//' | sed 's/.*-//'`
+    # restrict to a charset that's safe inside the awk -v assignment
+    VENDOR=`printf '%s' "$VENDOR" | tr -cd 'A-Za-z0-9._-'`
+    if [ -z "$VENDOR" ]; then
+      echo "Skipping subsite with empty/invalid vendor name: $SUBSITE" >&2
+      continue
+    fi
     echo "Downloading default passwords for ${VENDOR} ... " | tr -d "\n"
     $FETCH "${SITE}${SUBSITE}" | tr -d '\n\r' | sed 's/<tr/\n/gi' | sed 's/<\/tr/\n/gi' | \
       grep -iw celltext | sed 's/.*celltext">/,/i' | sed 's/<\/td>/,/g' | sed 's/<[a-z =/":;-]*>//gi' | \
-      sed 's/[\t ]*,[\t ]*/,/g' | sed 's/&[a-z]*;//gi' | sed 's/(unknown)//gi' | sed 's/(none)//gi' | sed 's/,unknown,/,,/gi' | sed 's/,none,/,,/gi' > dpl4hydra_${VENDOR}.tmp
+      sed 's/[\t ]*,[\t ]*/,/g' | sed 's/&[a-z]*;//gi' | sed 's/(unknown)//gi' | sed 's/(none)//gi' | sed 's/,unknown,/,,/gi' | sed 's/,none,/,,/gi' > "dpl4hydra_${VENDOR}.tmp"
 
-    cat dpl4hydra_${VENDOR}.tmp | awk -F, '{print"'$VENDOR',"$2","$3","$4","$5","$6","$7","$8","$9}' >> $FULLFILE
-    
-    rm dpl4hydra_${VENDOR}.tmp
+    awk -F, -v vendor="$VENDOR" '{print vendor","$2","$3","$4","$5","$6","$7","$8","$9}' "dpl4hydra_${VENDOR}.tmp" >> $FULLFILE
+
+    rm "dpl4hydra_${VENDOR}.tmp"
     echo "done."
   done
   rm $SUBSITES
@@ -154,15 +160,60 @@ generate ()
 
 LC_ALL=C
 export LC_ALL
+
+# Resolve the directory holding dpl4hydra_full.csv. Distro packages have
+# substituted INSTALLDIR / LOCATION inconsistently over the years (some leave
+# trailing slashes, Fedora's package uses an absolute LOCATION that already
+# contains INSTALLDIR), which used to produce paths like
+# "/usr//usr/share/hydra/dpl4hydra_full.csv" — see issue #1069. Try a few
+# plausible layouts and pick the first one that holds the data file.
 DPLPATH="."
-test -r "$DPLPATH/dpl4hydra_full.csv" || DPLPATH="$INSTALLDIR/$LOCATION"
+if [ ! -r "$DPLPATH/dpl4hydra_full.csv" ]; then
+    case "$LOCATION" in
+        /*)
+            for cand in \
+                "$LOCATION" \
+                "$INSTALLDIR/$LOCATION" \
+                "${INSTALLDIR%/}/${LOCATION#/}" \
+                "/usr/share/hydra" \
+                "/usr/local/etc" \
+                "/etc"
+            do
+                if [ -r "$cand/dpl4hydra_full.csv" ]; then
+                    DPLPATH="$cand"
+                    break
+                fi
+            done
+            ;;
+        *)
+            for cand in \
+                "$INSTALLDIR/$LOCATION" \
+                "${INSTALLDIR%/}/${LOCATION#/}" \
+                "/usr/share/hydra" \
+                "/usr/local/etc" \
+                "/etc"
+            do
+                if [ -r "$cand/dpl4hydra_full.csv" ]; then
+                    DPLPATH="$cand"
+                    break
+                fi
+            done
+            ;;
+    esac
+    # Fall back to the historical concat (with double-slash collapse) so the
+    # 'refresh' subcommand can still create the file the first time.
+    if [ "$DPLPATH" = "." ]; then
+        DPLPATH=`echo "${INSTALLDIR%/}/${LOCATION#/}" | sed 's|//*|/|g'`
+    fi
+fi
 FULLFILE="$DPLPATH/dpl4hydra_full.csv"
 OLDFILE="$DPLPATH/dpl4hydra_full.old"
 LOCALFILE="$DPLPATH/dpl4hydra_local.csv"
 INDEXSITE="$DPLPATH/dpl4hydra_index.tmp"
 SUBSITES="$DPLPATH/dpl4hydra_subs.tmp"
 CLEANFILE="$DPLPATH/dpl4hydra_clean.tmp"
-SITE="http://open-sez.me"
+# override with DPL_SITE in the environment if HTTPS breaks
+SITE="${DPL_SITE:-https://open-sez.me}"
 
 case $# in
 	0) usage

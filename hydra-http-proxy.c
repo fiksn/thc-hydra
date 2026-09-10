@@ -1,7 +1,7 @@
 #include "hydra-mod.h"
 #include "sasl.h"
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 static int32_t http_proxy_auth_mechanism = AUTH_ERROR;
 char *http_proxy_buf = NULL;
 
@@ -10,7 +10,7 @@ int32_t start_http_proxy(int32_t s, char *ip, int32_t port, unsigned char option
   char *login, *pass, buffer[5000], buffer2[4500];
   char url[510], host[60];
   char *header = ""; /* XXX TODO */
-  char *ptr, *fooptr, *auth_hdr;
+  char *ptr, *fooptr, *auth_hdr = NULL;
 
   if (strlen(login = hydra_get_next_login()) == 0)
     login = empty;
@@ -78,7 +78,7 @@ int32_t start_http_proxy(int32_t s, char *ip, int32_t port, unsigned char option
     }
   }
 
-  if (http_proxy_auth_mechanism == AUTH_BASIC || hydra_strcasestr(auth_hdr, "Proxy-Authenticate: Basic") != NULL) {
+  if (http_proxy_auth_mechanism == AUTH_BASIC || (auth_hdr != NULL && hydra_strcasestr(auth_hdr, "Proxy-Authenticate: Basic") != NULL)) {
     http_proxy_auth_mechanism = AUTH_BASIC;
     auth_hdr = NULL;
     sprintf(buffer2, "%.50s:%.50s", login, pass);
@@ -110,7 +110,7 @@ int32_t start_http_proxy(int32_t s, char *ip, int32_t port, unsigned char option
       hydra_report(stderr, "S:%-.*s\n", (int)(strchr(http_proxy_buf, '\r') - http_proxy_buf), http_proxy_buf);
     }
   } else {
-    if (http_proxy_auth_mechanism == AUTH_NTLM || hydra_strcasestr(auth_hdr, "Proxy-Authenticate: NTLM") != NULL) {
+    if (http_proxy_auth_mechanism == AUTH_NTLM || (auth_hdr != NULL && hydra_strcasestr(auth_hdr, "Proxy-Authenticate: NTLM") != NULL)) {
       unsigned char buf1[4096];
       unsigned char buf2[4096];
       char *pos = NULL;
@@ -151,15 +151,28 @@ int32_t start_http_proxy(int32_t s, char *ip, int32_t port, unsigned char option
         }
       }
       // recover challenge
-      if (http_proxy_buf != NULL && strlen(http_proxy_buf) >= 4) {
-        from64tobits((char *)buf1, pos);
+      if (http_proxy_buf != NULL && pos != NULL && strlen(http_proxy_buf) >= 4) {
+        if (from64tobits_n((char *)buf1, pos, sizeof(buf1)) < 0) {
+          hydra_report(stderr, "[ERROR] HTTP-PROXY NTLM AUTH: oversized challenge\n");
+          free(http_proxy_buf);
+          http_proxy_buf = NULL;
+          return 3;
+        }
         free(http_proxy_buf);
         http_proxy_buf = NULL;
+      } else {
         return 3;
       }
       // Send response
       buildAuthResponse((tSmbNtlmAuthChallenge *)buf1, (tSmbNtlmAuthResponse *)buf2, 0, login, pass, NULL, NULL);
       to64frombits(buf1, buf2, SmbLength((tSmbNtlmAuthResponse *)buf2));
+      /* The Type-3 base64 response embeds a server-controlled domain string
+       * and could exceed `buffer` for a malicious server. Refuse rather than
+       * overflow. */
+      if (strlen((char *)buf1) + strlen(url) + strlen(host) + strlen(header) + 128 >= sizeof(buffer)) {
+        hydra_report(stderr, "[ERROR] HTTP-PROXY NTLM AUTH: oversized response\n");
+        return 3;
+      }
       sprintf(buffer,
               "GET %s HTTP/1.0\r\n%sProxy-Authorization: NTLM %s\r\nUser-Agent: "
               "Mozilla/4.0 (Hydra)\r\nProxy-Connection: keep-alive\r\n%s\r\n",
@@ -181,7 +194,7 @@ int32_t start_http_proxy(int32_t s, char *ip, int32_t port, unsigned char option
         return 3;
     } else {
 #ifdef LIBOPENSSL
-      if (hydra_strcasestr(auth_hdr, "Proxy-Authenticate: Digest") != NULL) {
+      if (auth_hdr != NULL && hydra_strcasestr(auth_hdr, "Proxy-Authenticate: Digest") != NULL) {
         char *pbuffer, *result;
 
         http_proxy_auth_mechanism = AUTH_DIGESTMD5;
@@ -232,15 +245,23 @@ int32_t start_http_proxy(int32_t s, char *ip, int32_t port, unsigned char option
     }
   }
 
-  ptr = ((char *)strchr(http_proxy_buf, ' ')) + 1;
-  if (*ptr == '2' || (*ptr == '3' && *(ptr + 2) == '1') || (*ptr == '3' && *(ptr + 2) == '2') || (*ptr == '4' && *(ptr + 2) == '4')) {
+  {
+    char *space = strchr(http_proxy_buf, ' ');
+    ptr = space ? space + 1 : NULL;
+  }
+  if (ptr == NULL) {
+    hydra_report(stderr, "[INFO] Malformed proxy response (no status code) for %s:%s\n", login, pass);
+    hydra_completed_pair();
+    free(http_proxy_buf);
+    http_proxy_buf = hydra_receive_line(s);
+  } else if (*ptr == '2' || (*ptr == '3' && *(ptr + 2) == '1') || (*ptr == '3' && *(ptr + 2) == '2') || (*ptr == '4' && *(ptr + 2) == '4')) {
     hydra_report_found_host(port, ip, "http-proxy", fp);
     hydra_completed_pair_found();
     free(http_proxy_buf);
     http_proxy_buf = NULL;
   } else {
     if (*ptr != '4')
-      hydra_report(stderr, "[INFO] Unusual return code: %c for %s:%s\n", (char)*(strchr(http_proxy_buf, ' ') + 1), login, pass);
+      hydra_report(stderr, "[INFO] Unusual return code: %c for %s:%s\n", *ptr, login, pass);
     else if (verbose && *(ptr + 2) == '3')
       hydra_report(stderr, "[INFO] Potential success, could be false positive: %s:%s\n", login, pass);
     hydra_completed_pair();

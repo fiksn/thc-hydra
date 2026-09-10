@@ -6,7 +6,7 @@
 
 #include "hydra-mod.h"
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 
 char *buf;
 
@@ -105,7 +105,9 @@ void service_asterisk(char *ip, int32_t sp, unsigned char options, char *miscptr
           hydra_report(stderr,
                        "[ERROR] Not an Asterisk Call Manager protocol or "
                        "service shutdown: %s\n",
-                       buf);
+                       buf ? buf : "(no response)");
+        if (buf != NULL)
+          free(buf);
         hydra_child_exit(2);
       }
       free(buf);

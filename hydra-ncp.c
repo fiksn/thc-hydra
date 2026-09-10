@@ -21,7 +21,7 @@ void dummy_ncp() { printf("\n"); }
 #include <stdlib.h>
 #include <string.h>
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 extern int32_t child_head_no;
 
 typedef struct __NCP_DATA {
@@ -31,7 +31,7 @@ typedef struct __NCP_DATA {
 } _NCP_DATA;
 
 // uncomment line below to see more trace stack
-//#define NCP_DEBUG
+// #define NCP_DEBUG
 
 int32_t start_ncp(int32_t s, char *ip, int32_t port, unsigned char options, char *miscptr, FILE *fp) {
   char *login;
@@ -44,6 +44,10 @@ int32_t start_ncp(int32_t s, char *ip, int32_t port, unsigned char options, char
   _NCP_DATA *session;
 
   session = malloc(sizeof(_NCP_DATA));
+  if (session == NULL) {
+    hydra_report(stderr, "[ERROR] NCP: out of memory\n");
+    return 4;
+  }
   memset(session, 0, sizeof(_NCP_DATA));
   login = empty;
   pass = empty;
@@ -84,7 +88,8 @@ int32_t start_ncp(int32_t s, char *ip, int32_t port, unsigned char options, char
   }
 
   memset(session->spec.password, 0, sizeof(session->spec.password));
-  memcpy(session->spec.password, pass, strlen(pass) + 1);
+  strncpy(session->spec.password, pass, sizeof(session->spec.password) - 1);
+  session->spec.password[sizeof(session->spec.password) - 1] = 0;
   // str_upper(session->spec.password);
 
   ncp_lib_error_code = ncp_login_conn(session->conn, session->spec.user, object_type, session->spec.password);

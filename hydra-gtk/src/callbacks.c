@@ -308,7 +308,18 @@ int hydra_get_options(char *options[]) {
 
     widget = lookup_widget(GTK_WIDGET(wndMain), "entSMB2Workgroup");
 
-    snprintf(smbparm, sizeof(smbparm) - 1, "nthash:%s workgroup:{%s}", pth ? "true" : "false", (char *)gtk_entry_get_text((GtkEntry *)widget));
+    /* '}' would close the workgroup field early in hydra-smb2's miscptr
+     * parser (strchr(... '}')); refuse rather than silently truncate. */
+    {
+      const char *wg = (const char *)gtk_entry_get_text((GtkEntry *)widget);
+      if (wg && strchr(wg, '}') != NULL) {
+        g_warning("Workgroup contains '}' which is reserved for the SMB2 "
+                  "miscptr framing; please use a different workgroup.");
+        return 0;
+      }
+      snprintf(smbparm, sizeof(smbparm) - 1, "nthash:%s workgroup:{%s}",
+               pth ? "true" : "false", wg ? wg : "");
+    }
   } else if (!strcmp(tmp, "sapr3")) {
     widget = lookup_widget(GTK_WIDGET(wndMain), "spnSAPR3");
     j = gtk_spin_button_get_value_as_int((GtkSpinButton *)widget);
@@ -385,7 +396,7 @@ int hydra_get_options(char *options[]) {
   return i;
 }
 
-int update_statusbar() {
+gboolean update_statusbar(gpointer user_data) {
   int i, j;
   char *options[128];
   guint context_id;
@@ -469,7 +480,7 @@ int read_into(int fd) {
 
 /* wait for hydra output */
 
-static int wait_hydra_output(gpointer data) {
+static gboolean wait_hydra_output(gpointer data) {
   static int stdout_ok = TRUE, stderr_ok = TRUE;
   fd_set rset;
   struct timeval tv;
@@ -544,7 +555,7 @@ int *popen_re_unbuffered(char *command) {
 
   hydra_pid = 0;
 
-  update_statusbar();
+  update_statusbar(NULL);
 
   /* only allocate once */
   if (NULL == pfd)
@@ -624,7 +635,7 @@ void on_btnStop_clicked(GtkButton *button, gpointer user_data) {
   }
 }
 
-void on_wndMain_destroy(GtkObject *object, gpointer user_data) {
+void on_wndMain_destroy(GtkWidget *object, gpointer user_data) {
   if (hydra_pid != 0) {
     kill(hydra_pid, SIGTERM);
     hydra_pid = 0;
@@ -680,7 +691,10 @@ void on_btnSave_clicked(GtkButton *button, gpointer user_data) {
 
     fd = open(filename, O_CREAT | O_TRUNC | O_WRONLY, 0644);
     if (fd >= 0) {
-      write(fd, text, strlen(text));
+      size_t len = strlen(text);
+      ssize_t written = write(fd, text, len);
+      if (written < 0 || (size_t)written != len)
+        g_warning("%s::%i: write to output file failed!", __FILE__, __LINE__);
       close(fd);
     }
     g_free(text);

@@ -481,20 +481,20 @@ char *sasl_digest_md5(char *result, char *login, char *pass, char *buffer, char 
   if (strstr(type, "proxy") != NULL)
     snprintf(buffer, 500, "%s:%s", "HEAD", miscptr);
   else
-      // http case
-      if ((strstr(type, "GET") != NULL) || (strstr(type, "HEAD") != NULL))
-    snprintf(buffer, 500, "%s:%s", type, miscptr);
-  else
+    // http case
+    if ((strstr(type, "GET") != NULL) || (strstr(type, "HEAD") != NULL))
+      snprintf(buffer, 500, "%s:%s", type, miscptr);
+    else
       // sip case
       if (strstr(type, "sip") != NULL)
-    snprintf(buffer, 500, "REGISTER:%s:%s", type, miscptr);
-  else
-      // others
-      if (strstr(type, "rtsp") != NULL)
-    snprintf(buffer, 500, "DESCRIBE:%s://%s:%i", type, webtarget, port);
-  else
-    // others
-    snprintf(buffer, 500, "AUTHENTICATE:%s/%s", type, realm);
+        snprintf(buffer, 500, "REGISTER:%s:%s", type, miscptr);
+      else
+        // others
+        if (strstr(type, "rtsp") != NULL)
+          snprintf(buffer, 500, "DESCRIBE:%s://%s:%i%s", type, webtarget, port, miscptr ? miscptr : "");
+        else
+          // others
+          snprintf(buffer, 500, "AUTHENTICATE:%s/%s", type, realm);
 
   MD5_Init(&md5c);
   MD5_Update(&md5c, buffer, strlen(buffer));
@@ -543,8 +543,8 @@ char *sasl_digest_md5(char *result, char *login, char *pass, char *buffer, char 
         if (strstr(type, "rtsp") != NULL) {
           snprintf(result, 500,
                    "username=\"%s\", realm=\"%s\", nonce=\"%s\", "
-                   "uri=\"%s://%s:%i\", response=\"%s\"\r\n",
-                   preplogin, realm, nonce, type, webtarget, port, buffer);
+                   "uri=\"%s://%s:%i%s\", response=\"%s\"\r\n",
+                   preplogin, realm, nonce, type, webtarget, port, miscptr ? miscptr : "", buffer);
         } else {
           if (use_proxy == 1 && proxy_authentication[selected_proxy] != NULL)
             snprintf(result, 500,
@@ -627,6 +627,13 @@ char *sasl_scram_sha1(char *result, char *pass, char *clientfirstmessagebare, ch
   // continue to search from the previous successful call
   salt = strtok(NULL, ",");
   ic = strtok(NULL, ",");
+  /* The server-first-message must contain three comma-separated tokens; a
+   * truncated reply leaves ic == NULL and `ic + 2` would be (char *)0x2. */
+  if (ic == NULL || strlen(ic) < 3) {
+    hydra_report(stderr, "Error: malformed SCRAM server response\n");
+    free(preppasswd);
+    return NULL;
+  }
   iter = atoi(ic + 2);
   if (iter == 0) {
     hydra_report(stderr, "Error: Can't understand server response\n");

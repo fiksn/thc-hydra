@@ -35,7 +35,7 @@ struct team_speak {
 
 extern int32_t hydra_data_ready_timed(int32_t socket, long sec, long usec);
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 
 int32_t start_teamspeak(int32_t s, char *ip, int32_t port, unsigned char options, char *miscptr, FILE *fp) {
   char *empty = "";
@@ -80,7 +80,17 @@ int32_t start_teamspeak(int32_t s, char *ip, int32_t port, unsigned char options
   }
 
   if (hydra_data_ready_timed(s, 5, 0) > 0) {
-    hydra_recv(s, (char *)buf, sizeof(buf));
+    /* indexes 0x58/0x4B below need at least 0x59 bytes received. */
+    int32_t n;
+    memset(buf, 0, sizeof(buf));
+    n = hydra_recv(s, (char *)buf, sizeof(buf));
+    if (n < 0x59) {
+      hydra_report(stderr, "[ERROR] teamspeak short reply (%d bytes), skipping\n", n);
+      hydra_completed_pair();
+      if (memcmp(hydra_get_next_pair(), &HYDRA_EXIT, sizeof(HYDRA_EXIT)) == 0)
+        return 3;
+      return 1;
+    }
     if (buf[0x58] == 1) {
       hydra_report_found_host(port, ip, "teamspeak", fp);
       hydra_completed_pair_found();

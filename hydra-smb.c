@@ -85,7 +85,7 @@ http://technet.microsoft.com/en-us/library/cc960646.aspx
 #endif
 
 #ifndef TIME_T_MIN
-#define TIME_T_MIN ((time_t)0 < (time_t)-1 ? (time_t)0 : ~(time_t)0 << (sizeof(time_t) * CHAR_BIT - 1))
+#define TIME_T_MIN ((time_t)-1 < (time_t)0 ? (time_t)((uintmax_t)1u << (sizeof(time_t) * CHAR_BIT - 1)) : (time_t)0)
 #endif
 #ifndef TIME_T_MAX
 #define TIME_T_MAX (~(time_t)0 - TIME_T_MIN)
@@ -96,7 +96,7 @@ http://technet.microsoft.com/en-us/library/cc960646.aspx
 
 #define TIME_FIXUP_CONSTANT_INT 11644473600LL
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 static unsigned char challenge[8];
 static unsigned char workgroup[16];
 static unsigned char domain[16];
@@ -262,7 +262,12 @@ int32_t HashLM(unsigned char **lmhash, unsigned char *pass, unsigned char *chall
     }
 
     /* convert lower case characters to upper case */
-    strncpy((char *)password, (char *)pass, 14);
+    {
+      size_t plen = strlen((char *)pass);
+      if (plen > 14)
+        plen = 14;
+      memcpy(password, pass, plen);
+    }
     for (i = 0; i < 14; i++) {
       if ((password[i] >= 0x61) && (password[i] <= 0x7a)) /* a - z */
         password[i] -= 0x20;
@@ -772,7 +777,9 @@ int32_t SMBNegProt(int32_t s) {
 
   hydra_send(s, (char *)buf, iLength, 0);
   k = hydra_recv(s, (char *)rbuf, sizeof(rbuf));
-  if (k == 0)
+  /* hydra_recv returns int32_t; refuse negative (error) and short (< 42) replies
+   * before indexing rbuf[39] / iResponseOffset+8+32 below. */
+  if (k <= 0 || k < iResponseOffset + 8 + 32)
     return 3;
 
   /* retrieve the security mode */
@@ -881,6 +888,13 @@ unsigned long SMBSessionSetup(int32_t s, char *szLogin, char *szPassword, char *
   int32_t nReceiveBufferSize = 0;
   int32_t ret;
   int32_t iByteCount = 0, iOffset = 0;
+
+  /* the UTF-16 expansion below roughly doubles strlen(szLogin); cap it
+   * against buf[512] minus the per-message overhead. */
+  if (szLogin != NULL && strlen(szLogin) > 96) {
+    fprintf(stderr, "[ERROR] SMB login too long (max 96 chars)\n");
+    return -1;
+  }
 
   if (accntFlag == 0) {
     strcpy((char *)workgroup, "localhost");
@@ -1032,8 +1046,10 @@ unsigned long SMBSessionSetup(int32_t s, char *szLogin, char *szPassword, char *
       /* We don't need to actually calculated a LM hash for this mode, only NTLM
        */
       ret = HashNTLM(&NTLMhash, (unsigned char *)szPassword, (unsigned char *)challenge, miscptr);
-      if (ret == -1)
+      if (ret == -1) {
+        free(NTLMhash); /* Fix: prevent memory leak when HashNTLM fails */
         return -1;
+      }
 
       memcpy(buf + iOffset + 24, NTLMhash, 24); /* Skip space for LM hash */
       free(NTLMhash);
@@ -1186,10 +1202,10 @@ unsigned long SMBSessionSetup(int32_t s, char *szLogin, char *szPassword, char *
   /* Set native OS and LAN Manager values */
 
   char *szOSName = "Unix";
-  j = UTF8_UTF16LE((unsigned char *)szOSName, strlen(szOSName), buf + iOffset + iByteCount, 2 * sizeof(szOSName));
+  j = UTF8_UTF16LE((unsigned char *)szOSName, strlen(szOSName), buf + iOffset + iByteCount, 2 * strlen(szOSName));
   iByteCount += j + 2; // NULL terminated
   char *szLANMANName = "Samba";
-  j = UTF8_UTF16LE((unsigned char *)szLANMANName, strlen(szLANMANName), buf + iOffset + iByteCount, 2 * sizeof(szLANMANName));
+  j = UTF8_UTF16LE((unsigned char *)szLANMANName, strlen(szLANMANName), buf + iOffset + iByteCount, 2 * strlen(szLANMANName));
   iByteCount += j + 2; // NULL terminated
 
   /* Set the header length */
@@ -1199,15 +1215,19 @@ unsigned long SMBSessionSetup(int32_t s, char *szLogin, char *szPassword, char *
   if (verbose)
     hydra_report(stderr, "[VERBOSE] Set NBSS header length: %2.2X\n", buf[3]);
 
-  /* Set data byte count */
-  buf[iOffset - 2] = iByteCount;
+  /* Set data byte count: SMB1 BCC is a 16-bit little-endian field. */
+  buf[iOffset - 2] = iByteCount % 256;
+  buf[iOffset - 1] = iByteCount / 256;
   if (verbose)
     hydra_report(stderr, "[VERBOSE] Set byte count: %2.2X\n", buf[57]);
 
   hydra_send(s, (char *)buf, iOffset + iByteCount, 0);
 
+  /* the return value below indexes bufReceive[41]/[11]/[10]/[9] unconditionally,
+   * so require >= 42 bytes back; otherwise stack garbage parses as success. */
+  memset(bufReceive, 0, sizeof(bufReceive));
   nReceiveBufferSize = hydra_recv(s, bufReceive, sizeof(bufReceive));
-  if (/*(bufReceive == NULL) ||*/ (nReceiveBufferSize == 0))
+  if (nReceiveBufferSize < 42)
     return -1;
 
   /* 41 - Action (Guest/Non-Guest Account) */
@@ -1280,8 +1300,8 @@ int32_t start_smb(int32_t s, char *ip, int32_t port, unsigned char options, char
   } else if (SMBerr == 0x000193) { /* Valid password, account expired  */
     hydra_report(stdout, "[%d][smb] Host: %s Account: %s Valid password, account expired\n", port, ipaddr_str, login);
     hydra_report_found_host(port, ip, "smb", fp);
-    hydra_completed_pair_found();
-  } else if ((SMBerr == 0x000224) || (SMBerr == 0xC20002)) { /* Valid password, account expired  */
+    hydra_completed_pair_skip();
+  } else if ((SMBerr == 0x000224) || (SMBerr == 0xC20002)) { /* Valid password, password expired  */
     hydra_report(stdout,
                  "[%d][smb] Host: %s Account: %s Valid password, password "
                  "expired and must be changed on next logon\n",
@@ -1304,14 +1324,13 @@ int32_t start_smb(int32_t s, char *ip, int32_t port, unsigned char options, char
       hydra_report(stderr, "[INFO] LM dialect may be disabled, try LMV2 instead\n");
     hydra_completed_pair_skip();
   } else if (SMBerr == 0x000024) { /* change password on next login [success] */
-    hydra_report(stdout, "[%d][smb] Host: %s Account: %s Error: ACCOUNT_CHANGE_PASSWORD\n", port, ipaddr_str, login);
+    hydra_report(stdout, "[%d][smb] Host: %s Account: %s Information: ACCOUNT_CHANGE_PASSWORD\n", port, ipaddr_str, login);
     hydra_completed_pair_found();
   } else if (SMBerr == 0x00006D) { /* STATUS_LOGON_FAILURE */
     hydra_completed_pair();
   } else if (SMBerr == 0x000071) { /* password expired */
-    if (verbose)
-      fprintf(stderr, "[%d][smb] Host: %s Account: %s Error: PASSWORD EXPIRED\n", port, ipaddr_str, login);
-    hydra_completed_pair_skip();
+    hydra_report(stdout, "[%d][smb] Host: %s Account: %s Information: PASSWORD EXPIRED\n", port, ipaddr_str, login);
+    hydra_completed_pair_found();
   } else if ((SMBerr == 0x000072) || (SMBerr == 0xBF0002)) { /* account disabled */ /* BF0002 on w2k */
     if (verbose)
       fprintf(stderr, "[%d][smb] Host: %s Account: %s Error: ACCOUNT_DISABLED\n", port, ipaddr_str, login);
@@ -1488,6 +1507,7 @@ int32_t service_smb_init(char *ip, int32_t sp, unsigned char options, char *misc
 
   if (send(sock, buf, sizeof(buf), 0) < 0) {
     fprintf(stderr, "[ERROR] unable to send to target smb://%s:%d/\n", hostname, port);
+    close(sock);
     return -1;
   }
 
@@ -1498,11 +1518,13 @@ int32_t service_smb_init(char *ip, int32_t sp, unsigned char options, char *misc
 
   if (ready <= 0) {
     fprintf(stderr, "[ERROR] no reply from target smb://%s:%d/\n", hostname, port);
+    close(sock);
     return -1;
   }
 
   if ((ready = recv(sock, buf, sizeof(buf), 0)) < 40) {
     fprintf(stderr, "[ERROR] invalid reply from target smb://%s:%d/\n", hostname, port);
+    close(sock);
     return -1;
   }
 

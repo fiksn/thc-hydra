@@ -43,7 +43,7 @@ find something to pattern match against. This should be done together with -t 1.
 #include "hydra-http.h"
 #include "sasl.h"
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 char *buf;
 char *cond;
 extern int32_t http_auth_mechanism;
@@ -67,6 +67,7 @@ int32_t getcookie = 1;
 int32_t auth_flag = 0;
 int32_t code_302_is_success = 0;
 int32_t code_401_is_failure = 0;
+int32_t multipart_mode = 0;
 
 char cookie[4096] = "", cmiscptr[1024];
 
@@ -80,6 +81,7 @@ char bufferurl[6096 + 24], cookieurl[6096 + 24] = "", userheader[6096 + 24] = ""
 char redirected_url_buff[2048] = "";
 int32_t redirected_flag = 0;
 int32_t redirected_cpt = MAX_REDIRECT;
+int32_t uses_random_ip = 0;
 
 char *cookie_request = NULL, *normal_request = NULL; // Buffers for HTTP headers
 
@@ -307,6 +309,30 @@ int32_t add_header(ptr_header_node *ptr_head, char *header, char *value, char ty
 }
 
 /*
+ * Skip 0.0.0.0/8
+ * Skip 127.0.0.0/8 (loopback)
+ * Skip 224.0.0.0/4 (multicast)
+ * Skip 240.0.0.0/4 (reserved)
+ */
+char *generate_random_ip() {
+  static char ip_str[16]; // xxx.xxx.xxx.xxx\0 = 16 chars
+  static int32_t initialized = 0;
+  if (!initialized) {
+    srand(time(NULL) ^ getpid());
+    initialized = 1;
+  }
+  unsigned char octet1, octet2, octet3, octet4;
+  do {
+    octet1 = (unsigned char)(rand() % 256);
+  } while (octet1 == 0 || octet1 == 127 || octet1 >= 224);
+  octet2 = (unsigned char)(rand() % 256);
+  octet3 = (unsigned char)(rand() % 256);
+  octet4 = (unsigned char)(rand() % 256);
+  snprintf(ip_str, sizeof(ip_str), "%u.%u.%u.%u", octet1, octet2, octet3, octet4);
+  return ip_str;
+}
+
+/*
  * Replace in all headers' values every occurrence of oldvalue by newvalue.
  * Only user-defined headers are considered.
  */
@@ -351,12 +377,14 @@ void hdrrepv(ptr_header_node *ptr_head, char *hdrname, char *new_value) {
 }
 
 void cleanup(ptr_header_node *ptr_head) {
-  ptr_header_node cur_ptr = *ptr_head, next_ptr = cur_ptr;
+  ptr_header_node cur_ptr = *ptr_head, next_ptr;
 
-  while (next_ptr != NULL) {
+  while (cur_ptr != NULL) {
+    next_ptr = cur_ptr->next;
     free(cur_ptr->header);
     free(cur_ptr->value);
-    next_ptr = cur_ptr->next;
+    free(cur_ptr); /* Fix: also free the node itself to prevent memory leak */
+    cur_ptr = next_ptr;
   }
 
   *ptr_head = NULL;
@@ -454,6 +482,15 @@ int32_t parse_options(char *miscptr, ptr_header_node *ptr_head) {
       else
         miscptr += strlen(miscptr);
       break;
+    case 'm': // fall through
+    case 'M':
+      multipart_mode = 1;
+      tmp = strchr(miscptr, ':');
+      if (tmp)
+        miscptr = tmp + 1;
+      else
+        miscptr += strlen(miscptr);
+      break;
     case 'g': // fall through
     case 'G':
       ptr = miscptr + 2;
@@ -462,6 +499,36 @@ int32_t parse_options(char *miscptr, ptr_header_node *ptr_head) {
       if (*ptr != 0)
         *ptr++ = 0;
       getcookie = 0;
+      miscptr = ptr;
+      break;
+    case 'r': // fall through
+    case 'R':
+      ptr = miscptr + 2;
+      while (*ptr != 0 && (*ptr != ':' || *(ptr - 1) == '\\'))
+        ptr++;
+      if (*ptr != 0)
+        *ptr++ = 0;
+      tmp = hydra_strrep(miscptr + 2, "\\:", ":");
+      if (tmp == NULL)
+        tmp = miscptr + 2;
+      if (strcasecmp(tmp, "success") == 0) {
+        redirect_condition_type = REDIRECT_CONDITION_SUCCESS;
+        redirect_condition[0] = 0;
+      } else if (strcasecmp(tmp, "failure") == 0) {
+        redirect_condition_type = REDIRECT_CONDITION_FAILURE;
+        redirect_condition[0] = 0;
+      } else if (strncasecmp(tmp, "location=", 9) == 0 || strncasecmp(tmp, "location:", 9) == 0) {
+        char *location_match = tmp + 9;
+        if (strlen(location_match) >= REDIRECT_CONDITION_MAX_LEN) {
+          hydra_report(stderr, "[ERROR] R=location value cannot be bigger than %u.\n", REDIRECT_CONDITION_MAX_LEN - 1);
+          return 0;
+        }
+        redirect_condition_type = REDIRECT_CONDITION_LOCATION;
+        strcpy(redirect_condition, location_match);
+      } else {
+        hydra_report(stderr, "[ERROR] unknown redirect policy for R=: %s (expected success, failure or location=<text>)\n", tmp);
+        return 0;
+      }
       miscptr = ptr;
       break;
     case 'h':
@@ -530,6 +597,96 @@ int32_t parse_options(char *miscptr, ptr_header_node *ptr_head) {
     }
   }
   return 1;
+}
+
+char *build_multipart_body(char *multipart_boundary) {
+  if (!variables)
+    return NULL;
+
+  char *body = NULL;
+  size_t body_size = 0;
+
+  // Duplicate "variables" for tokenizing
+  char *vars_dup = strdup(variables);
+  if (!vars_dup)
+    return NULL;
+
+  // Tokenize the string using '&' as a delimiter
+  char *pair = strtok(vars_dup, "&");
+  while (pair != NULL) {
+    // Find the '=' separator in each pair
+    char *equal_sign = strchr(pair, '=');
+    if (!equal_sign) {
+      pair = strtok(NULL, "&");
+      continue;
+    }
+    *equal_sign = '\0';
+    char *key = pair;
+    char *value = equal_sign + 1;
+
+    // Build the multipart section for the field
+    int section_len = snprintf(NULL, 0,
+                               "--%s\r\n"
+                               "Content-Disposition: form-data; name=\"%s\"\r\n"
+                               "\r\n"
+                               "%s\r\n",
+                               multipart_boundary, key, value);
+
+    char *section = malloc(section_len + 1);
+    if (!section) {
+      free(body);
+      free(vars_dup);
+      return NULL;
+    }
+    snprintf(section, section_len + 1,
+             "--%s\r\n"
+             "Content-Disposition: form-data; name=\"%s\"\r\n"
+             "\r\n"
+             "%s\r\n",
+             multipart_boundary, key, value);
+
+    // Reallocate the body buffer to add this section
+    size_t new_body_size = body_size + section_len;
+    char *new_body = realloc(body, new_body_size + 1); // +1 for null terminator
+    if (!new_body) {
+      free(section);
+      free(body);
+      free(vars_dup);
+      return NULL;
+    }
+    body = new_body;
+    if (body_size == 0)
+      strcpy(body, section);
+    else
+      strcat(body, section);
+    body_size = new_body_size;
+    free(section);
+
+    pair = strtok(NULL, "&");
+  }
+  free(vars_dup);
+
+  // Append the closing boundary: --<boundary>--\r\n
+  int closing_len = snprintf(NULL, 0, "--%s--\r\n", multipart_boundary);
+  char *closing = malloc(closing_len + 1);
+  if (!closing) {
+    free(body);
+    return NULL;
+  }
+  snprintf(closing, closing_len + 1, "--%s--\r\n", multipart_boundary);
+
+  size_t final_size = body_size + closing_len;
+  char *final_body = realloc(body, final_size + 1);
+  if (!final_body) {
+    free(closing);
+    free(body);
+    return NULL;
+  }
+  body = final_body;
+  strcat(body, closing);
+  free(closing);
+
+  return body;
 }
 
 char *prepare_http_request(char *type, char *path, char *params, char *headers) {
@@ -740,7 +897,8 @@ int32_t start_http_form(int32_t s, char *ip, int32_t port, unsigned char options
   char *http_request = NULL;
   int32_t found = !success_cond, i, j;
   char content_length[MAX_CONTENT_LENGTH], proxy_string[MAX_PROXY_LENGTH];
-
+  char content_type[256];
+  static char last_random_ip[16]; // xxx.xxx.xxx.xxx\0 = 16 chars
   memset(header, 0, sizeof(header));
   cookie[0] = 0; // reset cookies from potential previous attempt
 
@@ -760,16 +918,45 @@ int32_t start_http_form(int32_t s, char *ip, int32_t port, unsigned char options
   clogin[sizeof(clogin) - 1] = 0;
   strncpy(cpass, html_encode(pass), sizeof(cpass) - 1);
   cpass[sizeof(cpass) - 1] = 0;
-  upd3variables = hydra_strrep(variables, "^USER^", clogin);
+
+  if (multipart_mode) {
+    snprintf(content_type, sizeof(content_type), "multipart/form-data; boundary=----THC-HydraBoundaryz2Z2z");
+    char *multipart_body = build_multipart_body("----THC-HydraBoundaryz2Z2z");
+    upd3variables = multipart_body;
+
+  } else {
+    snprintf(content_type, sizeof(content_type), "application/x-www-form-urlencoded");
+    upd3variables = variables;
+  }
+
+  upd3variables = hydra_strrep(upd3variables, "^USER^", clogin);
   upd3variables = hydra_strrep(upd3variables, "^PASS^", cpass);
   upd3variables = hydra_strrep(upd3variables, "^USER64^", b64login);
   upd3variables = hydra_strrep(upd3variables, "^PASS64^", b64pass);
+  /* hydra_strrep returns NULL on substitution overflow. */
+  if (upd3variables == NULL) {
+    if (debug)
+      hydra_report(stderr, "[DEBUG] placeholder substitution exceeded buffer; skipping pair\n");
+    hydra_completed_pair_skip();
+    return 1;
+  }
 
   // Replace the user/pass placeholders in the user-supplied headers
   hdrrep(&ptr_head, "^USER^", clogin);
   hdrrep(&ptr_head, "^PASS^", cpass);
   hdrrep(&ptr_head, "^USER64^", b64login);
   hdrrep(&ptr_head, "^PASS64^", b64pass);
+
+  if (uses_random_ip) {
+    char *random_ip = generate_random_ip();
+    if (last_random_ip[0] == '\0') { // First attempt: replace placeholder with random IP
+      hdrrep(&ptr_head, "^RAND_IP^", random_ip);
+    } else { // Subsequent attempts: replace previous IP with new random IP
+      hdrrep(&ptr_head, last_random_ip, random_ip);
+    }
+    strncpy(last_random_ip, random_ip, sizeof(last_random_ip) - 1);
+    last_random_ip[sizeof(last_random_ip) - 1] = '\0';
+  }
 
   /* again: no snprintf to be portable. don't worry, buffer can't overflow */
   if (use_proxy == 1 && proxy_authentication[selected_proxy] != NULL) {
@@ -796,7 +983,7 @@ int32_t start_http_form(int32_t s, char *ip, int32_t port, unsigned char options
       else
         add_header(&ptr_head, "Content-Length", content_length, HEADER_TYPE_DEFAULT);
       if (!header_exists(&ptr_head, "Content-Type", HEADER_TYPE_DEFAULT))
-        add_header(&ptr_head, "Content-Type", "application/x-www-form-urlencoded", HEADER_TYPE_DEFAULT);
+        add_header(&ptr_head, "Content-Type", content_type, HEADER_TYPE_DEFAULT);
       if (cookie_header != NULL)
         free(cookie_header);
       cookie_header = stringify_cookies(ptr_cookie);
@@ -862,7 +1049,7 @@ int32_t start_http_form(int32_t s, char *ip, int32_t port, unsigned char options
         else
           add_header(&ptr_head, "Content-Length", content_length, HEADER_TYPE_DEFAULT);
         if (!header_exists(&ptr_head, "Content-Type", HEADER_TYPE_DEFAULT))
-          add_header(&ptr_head, "Content-Type", "application/x-www-form-urlencoded", HEADER_TYPE_DEFAULT);
+          add_header(&ptr_head, "Content-Type", content_type, HEADER_TYPE_DEFAULT);
         if (cookie_header != NULL)
           free(cookie_header);
         cookie_header = stringify_cookies(ptr_cookie);
@@ -929,7 +1116,7 @@ int32_t start_http_form(int32_t s, char *ip, int32_t port, unsigned char options
         else
           add_header(&ptr_head, "Content-Length", content_length, HEADER_TYPE_DEFAULT);
         if (!header_exists(&ptr_head, "Content-Type", HEADER_TYPE_DEFAULT))
-          add_header(&ptr_head, "Content-Type", "application/x-www-form-urlencoded", HEADER_TYPE_DEFAULT);
+          add_header(&ptr_head, "Content-Type", content_type, HEADER_TYPE_DEFAULT);
         if (cookie_header != NULL)
           free(cookie_header);
         cookie_header = stringify_cookies(ptr_cookie);
@@ -1045,7 +1232,11 @@ int32_t start_http_form(int32_t s, char *ip, int32_t port, unsigned char options
 
           urlpath = strrchr(url, '/');
           if (urlpath != NULL) {
-            strncpy(urlpath_extracted, url, urlpath - url);
+            size_t cnt = (size_t)(urlpath - url);
+            if (cnt >= sizeof(urlpath_extracted))
+              cnt = sizeof(urlpath_extracted) - 1;
+            strncpy(urlpath_extracted, url, cnt);
+            urlpath_extracted[cnt] = 0;
             sprintf(str3, "%.1000s/%.1000s", urlpath_extracted, redirected_url_buff);
           } else {
             sprintf(str3, "%.1000s/%.1000s", url, redirected_url_buff);
@@ -1059,6 +1250,7 @@ int32_t start_http_form(int32_t s, char *ip, int32_t port, unsigned char options
       }
       if (str3[0] != '/') {
         j = strlen(str3);
+        if (j > sizeof(str3) - 2) j = sizeof(str3) - 2;
         str3[j + 1] = 0;
         for (i = j; i > 0; i--)
           str3[i] = str3[i - 1];
@@ -1072,6 +1264,42 @@ int32_t start_http_form(int32_t s, char *ip, int32_t port, unsigned char options
 
       if (verbose)
         hydra_report(stderr, "[VERBOSE] Page redirected to http[s]://%s%s\n", str2, str3);
+
+      /* on a cross-host redirect, drop the cookie jar and any
+       * operator-supplied Authorization header so we don't ship the
+       * original target's credentials to a third party. */
+      {
+        char orig_host[256];
+        char *colon;
+        size_t orig_len, str2_len;
+        strncpy(orig_host, webtarget ? webtarget : "", sizeof(orig_host) - 1);
+        orig_host[sizeof(orig_host) - 1] = 0;
+        if ((colon = strchr(orig_host, ':')) != NULL) *colon = 0;
+        orig_len = strlen(orig_host);
+        str2_len = strlen(str2);
+        /* match str2 against orig_host with tolerance for trailing :port */
+        int same_host = (str2_len >= orig_len)
+            && strncasecmp(str2, orig_host, orig_len) == 0
+            && (str2[orig_len] == 0 || str2[orig_len] == ':' || str2[orig_len] == '/');
+        if (!same_host) {
+          if (verbose)
+            hydra_report(stderr, "[VERBOSE] redirect crosses host boundary (%s -> %s); clearing cookies and Authorization\n", orig_host, str2);
+          {
+            ptr_cookie_node cur = ptr_cookie;
+            while (cur != NULL) {
+              ptr_cookie_node nxt = cur->next;
+              if (cur->name) free(cur->name);
+              if (cur->value) free(cur->value);
+              free(cur);
+              cur = nxt;
+            }
+            ptr_cookie = NULL;
+          }
+          /* remove operator-set Authorization header if any */
+          if (header_exists(&ptr_head, "Authorization", HEADER_TYPE_DEFAULT))
+            hdrrepv(&ptr_head, "Authorization", "");
+        }
+      }
 
       if (header_exists(&ptr_head, "Content-Length", HEADER_TYPE_DEFAULT))
         hdrrepv(&ptr_head, "Content-Length", "0");
@@ -1293,7 +1521,7 @@ ptr_header_node initialize(char *ip, unsigned char options, char *miscptr) {
 #ifdef AF_INET6
   }
 #endif
-  if (options & OPTION_SSL && webport != PORT_HTTP_SSL || !(options & OPTION_SSL) && webport != PORT_HTTP) {
+  if (((options & OPTION_SSL) && webport != PORT_HTTP_SSL) || (!(options & OPTION_SSL) && webport != PORT_HTTP)) {
     sprintf(ptr2, ":%d", webport);
   }
   webtarget = ptr;
@@ -1435,6 +1663,14 @@ ptr_header_node initialize(char *ip, unsigned char options, char *miscptr) {
     }
   }
 
+  ptr_header_node cur_ptr = NULL;
+  for (cur_ptr = ptr_head; cur_ptr; cur_ptr = cur_ptr->next) {
+    if ((cur_ptr->type == HEADER_TYPE_USERHEADER || cur_ptr->type == HEADER_TYPE_USERHEADER_REPL) && strstr(cur_ptr->value, "^RAND_IP^")) {
+      uses_random_ip = 1;
+      break;
+    }
+  }
+
   return ptr_head;
 }
 
@@ -1461,18 +1697,22 @@ void usage_http_form(const char *service) {
          " This is where most people get it wrong! You have to check the webapp what a\n"
          " failed string looks like and put it in this parameter! Add the -d switch to see\n"
          " the sent/received data!\n"
+         " Important: you can only define S= *OR* F= - not both\n"
          " Note that using invalid login condition checks can result in false positives!\n"
          "\nThe following parameters are optional and are put between the form parameters\n"
-         "and the condition string; seperate them too with colons:\n"
+         "and the condition string; separate them too with colons:\n"
          " 1=                  401 error response is interpreted as user/pass wrong\n"
          " 2=                  302 page forward return codes identify a successful attempt\n"
+         " M=                  attack forms that use multipart format\n"
          " (c|C)=/page/uri     to define a different page to gather initial "
          "cookies from\n"
          " (g|G)=              skip pre-requests - only use this when no pre-cookies are required\n"
          " (h|H)=My-Hdr\\: foo   to send a user defined HTTP header with each "
          "request\n"
-         "                 ^USER[64]^ and ^PASS[64]^ can also be put into these "
+         "                 ^USER[64]^, ^PASS[64]^, and ^RAND_IP^ can also be put into these "
          "headers!\n"
+         "                 ^RAND_IP^ generates a random IP address for each login attempt,\n"
+         "                 useful for testing rate limit bypass (e.g. h=X-Forwarded-For\\: ^RAND_IP^).\n"
          "                 Note: 'h' will add the user-defined header at the end\n"
          "                 regardless it's already being sent by Hydra or not.\n"
          "                 'H' will replace the value of that header if it "
@@ -1491,11 +1731,17 @@ void usage_http_form(const char *service) {
          "login.php:user=^USER64^&pass=^PASS64^&colon=colon\\:escape:S=result="
          "success\"\n"
          " \"/login.php:user=^USER^&pass=^PASS^&mid=123:authlog=.*failed\"\n"
-         " \"/:user=^USER&pass=^PASS^:H=Authorization\\: Basic "
+         " \"/:user=^USER^&pass=^PASS^:H=Authorization\\: Basic "
          "dT1w:H=Cookie\\: sessid=aaaa:h=X-User\\: ^USER^:H=User-Agent\\: wget\"\n"
          " \"/exchweb/bin/auth/:F=failed"
          "owaauth.dll:destination=http%%3A%%2F%%2F<target>%%2Fexchange&flags=0&"
          "username=<domain>%%5C^USER^&password=^PASS^&SubmitCreds=x&trusted=0:"
-         "C=/exchweb\":reason=\n",
+         "C=/exchweb\":reason=\n"
+         "To attack multiple targets, you can use the -M option with a file "
+         "containing the targets and their parameters.\n"
+         "Example file content:\n"
+         "  localhost:8443/login:type=login&login=^USER^&password=^PASS^:h=test\\: header:F=401\n"
+         "  localhost:9443/login2:type=login&login=^USER^&password=^PASS^:h=test\\: header:F=302\n"
+         "  ...\n\n",
          service);
 }

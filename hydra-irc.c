@@ -6,7 +6,7 @@ RFC 1459: Internet Relay Chat Protocol
 
 */
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 char buffer[300] = "";
 int32_t myport = PORT_IRC, mysslport = PORT_IRC_SSL;
 
@@ -20,7 +20,7 @@ int32_t start_oper_irc(int32_t s, char *ip, int32_t port, unsigned char options,
   if (strlen(pass = hydra_get_next_password()) == 0)
     pass = empty;
 
-  sprintf(buffer, "OPER %s %s\r\n", login, pass);
+  snprintf(buffer, sizeof(buffer), "OPER %.250s %.250s\r\n", login, pass);
   if (hydra_send(s, buffer, strlen(buffer), 0) < 0) {
     return 3;
   }

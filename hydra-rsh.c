@@ -10,7 +10,7 @@ no memleaks found on 110425
 
 */
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 
 int32_t start_rsh(int32_t s, char *ip, int32_t port, unsigned char options, char *miscptr, FILE *fp) {
   char *empty = "";
@@ -21,6 +21,10 @@ int32_t start_rsh(int32_t s, char *ip, int32_t port, unsigned char options, char
     login = empty;
 
   memset(buffer2, 0, sizeof(buffer2));
+  if (1 + strlen(login) + 1 + strlen(login) + 1 + strlen(COMMAND) + 1 > sizeof(buffer2)) {
+    hydra_completed_pair_skip();
+    return 4;
+  }
   bptr++;
 
   strcpy(bptr, login);
@@ -39,8 +43,8 @@ int32_t start_rsh(int32_t s, char *ip, int32_t port, unsigned char options, char
   if ((ret = hydra_recv(s, buffer, sizeof(buffer) - 1)) > 0)
     buffer[ret] = 0;
   else /* 0x00 is sent but hydra_recv transformed it */
-      if ((ret = hydra_recv(s, buffer, sizeof(buffer) - 1)) > 0)
-    buffer[ret] = 0;
+    if ((ret = hydra_recv(s, buffer, sizeof(buffer) - 1)) > 0)
+      buffer[ret] = 0;
 #ifdef HAVE_PCRE
   if (ret > 0 && (!hydra_string_match(buffer, "\\s(failure|incorrect|denied)"))) {
 #else

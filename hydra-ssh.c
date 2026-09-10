@@ -18,7 +18,7 @@ void dummy_ssh() { printf("\n"); }
 ssh_session session = NULL;
 
 extern hydra_option hydra_options;
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 int32_t new_session = 1;
 
 int32_t start_ssh(int32_t s, char *ip, int32_t port, unsigned char options, char *miscptr, FILE *fp) {
@@ -41,8 +41,9 @@ int32_t start_ssh(int32_t s, char *ip, int32_t port, unsigned char options, char
     }
 
     session = ssh_new();
-    ssh_options_set(session, SSH_OPTIONS_PORT, &port);
     ssh_options_set(session, SSH_OPTIONS_HOST, hydra_address2string(ip));
+    ssh_options_parse_config(session, NULL);
+    ssh_options_set(session, SSH_OPTIONS_PORT, &port);
     ssh_options_set(session, SSH_OPTIONS_USER, login);
     ssh_options_set(session, SSH_OPTIONS_TIMEOUT, &hydra_options.waittime);
     ssh_options_set(session, SSH_OPTIONS_COMPRESSION_C_S, "none");
@@ -179,6 +180,23 @@ int32_t service_ssh_init(char *ip, int32_t sp, unsigned char options, char *misc
   //   3 skip target because its unreachable
 #ifdef LIBSSH
   int32_t rc, method;
+  /* libssh < 0.10.6 has client-side parser CVEs (e.g. CVE-2025-4877) that
+   * fire on the server's response. Warn at runtime if linked against an
+   * old version. */
+  {
+    const char *vstr = ssh_version(0);
+    if (vstr != NULL) {
+      int maj = 0, min = 0, patch = 0;
+      if (sscanf(vstr, "%d.%d.%d", &maj, &min, &patch) >= 2) {
+        if (maj == 0 && (min < 10 || (min == 10 && patch < 6))) {
+          fprintf(stderr,
+                  "[WARNING] linked libssh %s is older than 0.10.6; client-side CVEs "
+                  "(e.g. CVE-2025-4877) may be triggered by a malicious target server.\n",
+                  vstr);
+        }
+      }
+    }
+  }
   ssh_init();
   ssh_session session = ssh_new();
 
@@ -186,8 +204,9 @@ int32_t service_ssh_init(char *ip, int32_t sp, unsigned char options, char *misc
     printf("[INFO] Testing if password authentication is supported by "
            "ssh://%s@%s:%d\n",
            miscptr == NULL ? "hydra" : miscptr, hydra_address2string_beautiful(ip), port);
-  ssh_options_set(session, SSH_OPTIONS_PORT, &port);
   ssh_options_set(session, SSH_OPTIONS_HOST, hydra_address2string(ip));
+  ssh_options_parse_config(session, NULL);
+  ssh_options_set(session, SSH_OPTIONS_PORT, &port);
   if (miscptr == NULL)
     ssh_options_set(session, SSH_OPTIONS_USER, "hydra");
   else

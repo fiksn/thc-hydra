@@ -1,7 +1,7 @@
 #include "hydra-mod.h"
 #include "sasl.h"
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 char *buf;
 int32_t counter;
 
@@ -22,15 +22,27 @@ char *imap_read_server_capacity(int32_t sock) {
         usleepn(300);
         /* we got the capability info then get the completed warning info from
          * server */
+        /* concatenate so CAPABILITY tokens that straddle a segment boundary
+         * are not lost between iterations. */
         while (hydra_data_ready(sock)) {
-          free(buf);
-          buf = hydra_receive_line(sock);
+          char *next = hydra_receive_line(sock);
+          if (next == NULL) break;
+          {
+            size_t bl = buf ? strlen(buf) : 0;
+            size_t nl = strlen(next);
+            char *combined = malloc(bl + nl + 1);
+            if (combined == NULL) { free(next); break; }
+            if (buf) memcpy(combined, buf, bl);
+            memcpy(combined + bl, next, nl + 1);
+            free(buf);
+            free(next);
+            buf = combined;
+          }
         }
       } else {
-        if (buf[strlen(buf) - 1] == '\n')
-          buf[strlen(buf) - 1] = 0;
-        if (buf[strlen(buf) - 1] == '\r')
-          buf[strlen(buf) - 1] = 0;
+        size_t blen = strlen(buf);
+        while (blen > 0 && (buf[blen - 1] == '\n' || buf[blen - 1] == '\r'))
+          buf[--blen] = 0;
         if (isdigit((int32_t)*ptr) && *(ptr + 1) == ' ') {
           resp = 1;
         }
@@ -84,7 +96,9 @@ int32_t start_imap(int32_t s, char *ip, int32_t port, unsigned char options, cha
       return 3;
     }
     free(buf);
-    strcpy(buffer2, pass);
+    /* Fix buffer overflow: use strncpy to prevent overflow when password exceeds buffer size */
+    strncpy(buffer2, pass, sizeof(buffer2) - 1);
+    buffer2[sizeof(buffer2) - 1] = '\0';
     hydra_tobase64((unsigned char *)buffer2, strlen(buffer2), sizeof(buffer2));
     sprintf(buffer, "%.250s\r\n", buffer2);
     break;
@@ -155,8 +169,21 @@ int32_t start_imap(int32_t s, char *ip, int32_t port, unsigned char options, cha
       return 3;
     }
 
+    /* Need at least the "+ " continuation prefix plus one base64 byte; without
+     * this guard a single-byte server reply would make `buf + 2` read past the
+     * heap allocation. */
+    if (strlen(buf) < 4) {
+      free(buf);
+      free(preplogin);
+      return 3;
+    }
     memset(buffer, 0, sizeof(buffer));
-    from64tobits((char *)buffer, buf + 2);
+    if (from64tobits_n((char *)buffer, buf + 2, sizeof(buffer)) < 0) {
+      hydra_report(stderr, "[ERROR] IMAP CRAM-* AUTH: oversized challenge\n");
+      free(buf);
+      free(preplogin);
+      return 3;
+    }
     free(buf);
 
     memset(buffer2, 0, sizeof(buffer2));
@@ -202,8 +229,18 @@ int32_t start_imap(int32_t s, char *ip, int32_t port, unsigned char options, cha
       free(buf);
       return 3;
     }
+    /* Skip the IMAP "+ " continuation prefix; require at least 4 bytes
+     * before reading buf + 2. */
+    if (strlen(buf) < 4) {
+      free(buf);
+      return 3;
+    }
     memset(buffer, 0, sizeof(buffer));
-    from64tobits((char *)buffer, buf);
+    if (from64tobits_n((char *)buffer, buf + 2, sizeof(buffer)) < 0) {
+      hydra_report(stderr, "[ERROR] IMAP DIGEST-MD5 AUTH: oversized challenge\n");
+      free(buf);
+      return 3;
+    }
     free(buf);
 
     if (debug)
@@ -261,9 +298,17 @@ int32_t start_imap(int32_t s, char *ip, int32_t port, unsigned char options, cha
       return 1;
     } else {
       /* recover server challenge */
+      if (strlen(buf) < 4) {
+        free(buf);
+        return 1;
+      }
       memset(buffer, 0, sizeof(buffer));
       //+ cj1oeWRyYU9VNVZqcHQ5RjNqcmVXRVFWTCxzPWhGbTNnRGw0akdidzJVVHosaT00MDk2
-      from64tobits((char *)buffer, buf + 2);
+      if (from64tobits_n((char *)buffer, buf + 2, sizeof(buffer)) < 0) {
+        hydra_report(stderr, "[ERROR] IMAP SCRAM-SHA1 AUTH: oversized challenge\n");
+        free(buf);
+        return 1;
+      }
       free(buf);
       strncpy(serverfirstmessage, buffer, sizeof(serverfirstmessage) - 1);
       serverfirstmessage[sizeof(serverfirstmessage) - 1] = '\0';
@@ -314,13 +359,23 @@ int32_t start_imap(int32_t s, char *ip, int32_t port, unsigned char options, cha
     }
 
     // recover challenge
-    from64tobits((char *)buf1, buf + 2);
+    if (from64tobits_n((char *)buf1, buf + 2, sizeof(buf1)) < 0) {
+      hydra_report(stderr, "[ERROR] IMAP NTLM AUTH: oversized challenge\n");
+      free(buf);
+      return 3;
+    }
     free(buf);
 
     // Send response
     buildAuthResponse((tSmbNtlmAuthChallenge *)buf1, (tSmbNtlmAuthResponse *)buf2, 0, login, pass, NULL, NULL);
     to64frombits(buf1, buf2, SmbLength((tSmbNtlmAuthResponse *)buf2));
 
+    /* The Type-3 base64 response embeds a server-controlled domain string and
+     * can exceed `buffer` for a malicious server. Refuse rather than overflow. */
+    if (strlen((char *)buf1) + 2 >= sizeof(buffer)) {
+      hydra_report(stderr, "[ERROR] IMAP NTLM AUTH: oversized response\n");
+      return 3;
+    }
     sprintf(buffer, "%s\r\n", buf1);
   } break;
   default:

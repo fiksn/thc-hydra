@@ -9,7 +9,7 @@
 
 extern int32_t hydra_data_ready_timed(int32_t socket, long sec, long usec);
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 extern int32_t child_head_no;
 
 char snmpv3buf[1024], *snmpv3info = NULL;
@@ -96,8 +96,13 @@ void password_to_key_md5(u_char *password,   /* IN */
   if (mylen < 8) {
     memset(bpass, 0, sizeof(bpass));
     strncpy(bpass, password, sizeof(bpass) - 1);
+    /* An empty password makes the loop unable to advance — bail before that. */
+    if (passwordlen == 0)
+      mylen = 8;
     while (mylen < 8) {
-      strcat(bpass, password);
+      if (strlen(bpass) + passwordlen >= sizeof(bpass))
+        break;
+      strncat(bpass, password, sizeof(bpass) - strlen(bpass) - 1);
       mylen += passwordlen;
     }
     mypass = bpass;
@@ -138,13 +143,25 @@ void password_to_key_sha(u_char *password,   /* IN */
                          u_char *key) {      /* OUT - pointer to caller 20-octet buffer */
   SHA_CTX SH;
   u_char *cp, password_buf[80], *mypass = password, bpass[17];
-  u_long password_index = 0, count = 0, i, mylen = passwordlen, myelen = engineLength;
+  u_long password_index = 0, count = 0, i, mylen, myelen = engineLength;
+
+  /* mirror the MD5 sibling above: cap passwordlen against bpass[]. */
+  if (strlen((const char *)password) > passwordlen)
+    passwordlen = strlen((const char *)password);
+  if (passwordlen > sizeof(bpass) - 1)
+    passwordlen = sizeof(bpass) - 1;
+  mylen = passwordlen;
 
   if (mylen < 8) {
     memset(bpass, 0, sizeof(bpass));
-    strcpy(bpass, password);
+    strncpy((char *)bpass, (const char *)password, sizeof(bpass) - 1);
+    /* An empty password makes the loop unable to advance — bail before that. */
+    if (passwordlen == 0)
+      mylen = 8;
     while (mylen < 8) {
-      strcat(bpass, password);
+      if (strlen((const char *)bpass) + passwordlen >= sizeof(bpass))
+        break;
+      strncat((char *)bpass, (const char *)password, sizeof(bpass) - strlen((const char *)bpass) - 1);
       mylen += passwordlen;
     }
     mypass = bpass;
@@ -207,13 +224,30 @@ int32_t start_snmp(int32_t s, char *ip, int32_t port, unsigned char options, cha
       size = sizeof(snmpv1_w);
     }
 
-    snmpv1_a.comlen = (char)strlen(pass);
-    snmpv1_a.len = snmpv1_a.comlen + size + sizeof(snmpv1_a) - 3;
+    /* Fix buffer overflow: limit password length to available buffer space.
+     * The SNMP packet structure references comlen, so we must truncate the
+     * password itself rather than only the copy, to keep i consistent with
+     * the actual bytes written and avoid later memcpy overrunning buffer. */
+    {
+      size_t pass_len = strlen(pass);
+      size_t max_pass = sizeof(buffer) - sizeof(snmpv1_a) - size;
+      size_t max_pass_ber = 0;
 
-    i = sizeof(snmpv1_a);
-    memcpy(buffer, &snmpv1_a, i);
-    strcpy(buffer + i, pass);
-    i += strlen(pass);
+      if (pass_len > max_pass)
+        pass_len = max_pass;
+      if (size + sizeof(snmpv1_a) - 3 < 0x80) {
+        max_pass_ber = 0x7f - (size + sizeof(snmpv1_a) - 3);
+        if (pass_len > max_pass_ber)
+          pass_len = max_pass_ber;
+      }
+      snmpv1_a.comlen = (char)pass_len;
+      snmpv1_a.len = snmpv1_a.comlen + size + sizeof(snmpv1_a) - 3;
+
+      i = sizeof(snmpv1_a);
+      memcpy(buffer, &snmpv1_a, i);
+      memcpy(buffer + i, pass, pass_len);
+      i += pass_len;
+    }
 
     if (snmpread) {
       memcpy(buffer + i, &snmpv1_r, size);

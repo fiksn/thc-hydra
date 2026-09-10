@@ -1,7 +1,7 @@
 #include "hydra-mod.h"
 #include "sasl.h"
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 
 unsigned char *buf;
 int32_t counter;
@@ -36,6 +36,11 @@ int32_t start_ldap(int32_t s, char *ip, int32_t port, unsigned char options, cha
   switch (ldap_auth_mechanism) {
   case AUTH_CLEAR:
     length = 14 + strlen(login) + strlen(pass);
+    /* the BIND length-prefix bytes are u8, so login/pass are each <= 255. */
+    if (length > sizeof(buffer) || strlen(login) > 255 || strlen(pass) > 255) {
+      hydra_completed_pair_skip();
+      return -1;
+    }
     break;
 #ifdef LIBOPENSSL
   case AUTH_CRAMMD5:
@@ -119,7 +124,8 @@ int32_t start_ldap(int32_t s, char *ip, int32_t port, unsigned char options, cha
   if (ldap_auth_mechanism == AUTH_CRAMMD5) {
     /* get the challenge, need to extract it */
     char *ptr;
-    char buf2[32];
+    /* sasl_cram_md5 writes 32 hex bytes plus a NUL — needs at least 33. */
+    char buf2[64];
 
     ptr = strstr((char *)buf, "<");
     fooptr = buf2;
@@ -132,6 +138,12 @@ int32_t start_ldap(int32_t s, char *ip, int32_t port, unsigned char options, cha
     }
 
     length = 12 + strlen(miscptr) + 4 + strlen("CRAM-MD5") + 2 + strlen(login) + 1 + strlen(buf2);
+    /* Refuse server-driven inputs that would overrun the 512-byte buffer. */
+    if (length > sizeof(buffer) || strlen(miscptr) > 220 || strlen(login) > 200 || strlen(buf2) > sizeof(buf2)) {
+      hydra_completed_pair_skip();
+      free(buf);
+      return -1;
+    }
 
     memset(buffer, 0, sizeof(buffer));
     buffer[0] = 48;
@@ -187,6 +199,15 @@ int32_t start_ldap(int32_t s, char *ip, int32_t port, unsigned char options, cha
       }
 
       length = 26 + strlen(miscptr) + strlen("DIGEST-MD5") + strlen(buffer2);
+      /* The server-controlled DIGEST-MD5 challenge fields drive `buffer2`
+       * up to its 500-byte cap; together with miscptr the total can exceed
+       * the 512-byte `buffer`. Refuse the attempt before the memcpy chain
+       * starts writing past the buffer. */
+      if (length > sizeof(buffer) || strlen(miscptr) > 220 || strlen(buffer2) > sizeof(buffer) - 32) {
+        hydra_completed_pair_skip();
+        free(buf);
+        return -1;
+      }
 
       memset(buffer, 0, sizeof(buffer));
       ind = 0;

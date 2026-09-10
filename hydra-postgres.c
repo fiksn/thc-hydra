@@ -17,7 +17,7 @@ void dummy_postgres() { printf("\n"); }
 #define DEFAULT_DB "template1"
 
 extern hydra_option hydra_options;
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 
 int32_t start_postgres(int32_t s, char *ip, int32_t port, unsigned char options, char *miscptr, FILE *fp) {
   char *empty = "";
@@ -41,7 +41,12 @@ int32_t start_postgres(int32_t s, char *ip, int32_t port, unsigned char options,
    *      Building the connection string
    */
 
-  snprintf(connection_string, sizeof(connection_string), "host = '%s' dbname = '%s' user = '%s' password = '%s' ", hydra_address2string(ip), database, login, pass);
+  /* a single-quote in login/pass would inject extra libpq parameters. */
+  if (strchr(login, '\'') != NULL || strchr(pass, '\'') != NULL) {
+    hydra_completed_pair_skip();
+    return 2;
+  }
+  snprintf(connection_string, sizeof(connection_string), "host = '%s' port = '%d' dbname = '%s' user = '%s' password = '%s' ", hydra_address2string(ip), port, database, login, pass);
 
   if (verbose)
     hydra_report(stderr, "connection string: %s\n", connection_string);

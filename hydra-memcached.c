@@ -14,7 +14,7 @@ void dummy_mcached() { printf("\n"); }
 extern int32_t hydra_data_ready_timed(int32_t socket, long sec, long usec);
 
 extern hydra_option hydra_options;
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 
 int mcached_send_com_quit(int32_t sock) {
   char *com_quit = "quit\r\n";
@@ -161,7 +161,7 @@ int32_t service_mcached_init(char *ip, int32_t sp, unsigned char options, char *
 
   if (hydra_data_ready_timed(sock, 0, 1000) > 0) {
     buf = hydra_receive_line(sock);
-    if (strstr(buf, "VERSION ")) {
+    if (buf != NULL && strstr(buf, "VERSION ")) {
       hydra_report_found_host(port, ip, "memcached", fp);
       mcached_send_com_quit(sock);
       if (sock >= 0)

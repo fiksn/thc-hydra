@@ -34,7 +34,7 @@ int32_t do_retry = 1;
 int32_t module_auth_type = -1;
 int32_t intern_socket, extern_socket;
 char pair[260];
-char *HYDRA_EXIT = "\x00\xff\x00\xff\x00";
+const unsigned char HYDRA_EXIT[5] = {0x00, 0xff, 0x00, 0xff, 0x00};
 char *HYDRA_EMPTY = "\x00\x00\x00\x00";
 char *fe80 = "\xfe\x80\x00";
 int32_t fail = 0;
@@ -58,9 +58,12 @@ RSA *rsa = NULL;
 
 /* prototype */
 int32_t my_select(int32_t fd, fd_set *fdread, fd_set *fdwrite, fd_set *fdex, long sec, long usec);
+int32_t internal__hydra_recv(int32_t socket, char *buf, uint32_t length);
+static int32_t hydra_recv_proxy_line(int32_t socket, char *buf, size_t size, long sec, long usec);
 
 /* ----------------- alarming functions ---------------- */
-void alarming() {
+void alarming(int signal) {
+  (void)signal;
   fail++;
   alarm_went_off++;
 
@@ -88,6 +91,41 @@ void interrupt() {
 }
 
 /* ----------------- internal functions ----------------- */
+
+static int32_t hydra_recv_proxy_line(int32_t socket, char *buf, size_t size, long sec, long usec) {
+  int32_t ret;
+  size_t got = 0;
+  fd_set fdread;
+
+  if (size < 2)
+    return -1;
+
+  while (got + 1 < size) {
+    FD_ZERO(&fdread);
+    FD_SET(socket, &fdread);
+    ret = my_select(socket + 1, &fdread, NULL, NULL, sec, usec);
+    if (ret <= 0)
+      break;
+
+    ret = internal__hydra_recv(socket, buf + got, 1);
+    if (ret <= 0) {
+      /* NUL-terminate partial buffer so callers may safely use strchr/strstr
+       * without walking heap past the bytes the proxy actually delivered. */
+      buf[got] = 0;
+      return got > 0 ? (int32_t)got : ret;
+    }
+
+    got += ret;
+    if (buf[got - 1] == '\n')
+      break;
+
+    sec = 0;
+    usec = 100000;
+  }
+
+  buf[got] = 0;
+  return (int32_t)got;
+}
 
 int32_t internal__hydra_connect(char *host, int32_t port, int32_t type, int32_t protocol) {
   int32_t s, ret = -1, ipv6 = 0, reset_selected = 0;
@@ -301,8 +339,12 @@ int32_t internal__hydra_connect(char *host, int32_t port, int32_t type, int32_t 
             *ptr = 0;
           printf("DEBUG_CONNECT_PROXY_SENT: %s\n", buf);
         }
-        recv(s, buf, 4096, 0);
-        if (strncmp("HTTP/", buf, 5) == 0 && (tmpptr = strchr(buf, ' ')) != NULL && *++tmpptr == '2') {
+        tmpptr = NULL;
+        ret = hydra_recv_proxy_line(s, buf, 4096, waittime, 0);
+        if (ret <= 0) {
+          hydra_report(stderr, "[ERROR] CONNECT proxy did not return a status line\n");
+          err = 1;
+        } else if (strncmp("HTTP/", buf, 5) == 0 && (tmpptr = strchr(buf, ' ')) != NULL && *++tmpptr == '2') {
           if (debug)
             printf("DEBUG_CONNECT_PROXY_OK\n");
         } else {
@@ -344,17 +386,30 @@ int32_t internal__hydra_connect(char *host, int32_t port, int32_t type, int32_t 
             if (err != 1) {
               /* send user/pass */
               if (proxy_authentication[selected_proxy] != NULL) {
-                // format was checked previously
-                char *login = strtok(proxy_authentication[selected_proxy], ":");
-                char *pass = strtok(NULL, ":");
+                const char *auth = proxy_authentication[selected_proxy];
+                const char *separator = strchr(auth, ':');
+                const char *pass = separator == NULL ? NULL : separator + 1;
+                size_t login_len = separator == NULL ? 0 : (size_t)(separator - auth);
+                size_t pass_len = pass == NULL ? 0 : strlen(pass);
 
-                snprintf(buf, 4096, "\x01%c%s%c%s", (char)strlen(login), login, (char)strlen(pass), pass);
-
-                cnt = hydra_send(s, buf, strlen(buf), 0);
-                if (cnt != strlen(buf)) {
-                  hydra_report(stderr, "[ERROR] SOCKS5 proxy write failed (%zu/3)\n", cnt);
+                if (separator == NULL || login_len > 255 || pass_len > 255) {
+                  hydra_report(stderr, "[ERROR] Invalid SOCKS5 proxy authentication state\n");
                   err = 1;
                 } else {
+                  buf[0] = 0x01;
+                  buf[1] = (unsigned char)login_len;
+                  memcpy(buf + 2, auth, login_len);
+                  buf[2 + login_len] = (unsigned char)pass_len;
+                  memcpy(buf + 3 + login_len, pass, pass_len);
+                  wlen = 3 + login_len + pass_len;
+
+                  cnt = hydra_send(s, buf, wlen, 0);
+                }
+                if (err != 1 && cnt != wlen) {
+                  hydra_report(stderr, "[ERROR] SOCKS5 proxy write failed (%zu/3)\n", cnt);
+                  err = 1;
+                }
+                if (err != 1) {
                   cnt = hydra_recv(s, buf, 2);
                   if (cnt != 2) {
                     hydra_report(stderr, "[ERROR] SOCKS5 proxy read failed (%zu/2)\n", cnt);
@@ -662,10 +717,12 @@ char *hydra_get_next_pair() {
     pair[sizeof(pair) - 1] = 0;
     __fck = read(intern_socket, pair, sizeof(pair) - 1);
     // if (debug) hydra_dump_data(pair, __fck, "CHILD READ PAIR");
-    if (pair[0] == 0 || __fck <= 0)
+    if (__fck <= 0)
       return HYDRA_EMPTY;
-    if (__fck >= sizeof(HYDRA_EXIT) && memcmp(&HYDRA_EXIT, &pair, sizeof(HYDRA_EXIT)) == 0)
-      return HYDRA_EXIT;
+    if (__fck == sizeof(HYDRA_EXIT) && memcmp(pair, HYDRA_EXIT, sizeof(HYDRA_EXIT)) == 0)
+      return (char *)HYDRA_EXIT;
+    if (pair[0] == 0)
+      return HYDRA_EMPTY;
   }
   return pair;
 }
@@ -924,7 +981,7 @@ int32_t hydra_recv(int32_t socket, char *buf, uint32_t length) {
   ret = internal__hydra_recv(socket, buf, length);
   if (debug) {
     sprintf(text, "[DEBUG] RECV [pid:%d]", getpid());
-    hydra_dump_data(buf, ret, text);
+    hydra_dump_data((unsigned char *)buf, ret, text);
     // hydra_report_debug(stderr, "DEBUG_RECV_BEGIN|%s|END [pid:%d ret:%d]",
     // buf, getpid(), ret);
   }
@@ -940,13 +997,13 @@ int32_t hydra_recv_nb(int32_t socket, char *buf, uint32_t length) {
       buf[0] = 0;
       if (debug) {
         sprintf(text, "[DEBUG] RECV [pid:%d]", getpid());
-        hydra_dump_data(buf, ret, text);
+        hydra_dump_data((unsigned char *)buf, ret, text);
       }
       return ret;
     }
     if (debug) {
       sprintf(text, "[DEBUG] RECV [pid:%d]", getpid());
-      hydra_dump_data(buf, ret, text);
+      hydra_dump_data((unsigned char *)buf, ret, text);
       // hydra_report_debug(stderr, "DEBUG_RECV_BEGIN|%s|END [pid:%d ret:%d]",
       // buf, getpid(), ret);
     }
@@ -993,16 +1050,16 @@ char *hydra_receive_line(int32_t socket) {
         // some error occured
         got = -1;
       }
-    } while (hydra_data_ready(socket) > 0 && j > 0
+    } while ((hydra_data_ready(socket) > 0 && j > 0)
 #ifdef LIBOPENSSL
-             || use_ssl && SSL_pending(ssl)
+             || (use_ssl && SSL_pending(ssl))
 #endif
     );
 
     if (got > 0) {
       if (debug) {
         sprintf(pid, "[DEBUG] RECV [pid:%d]", getpid());
-        hydra_dump_data(buff, got, pid);
+        hydra_dump_data((unsigned char *)buff, got, pid);
         // hydra_report_debug(stderr, "DEBUG_RECV_BEGIN [pid:%d len:%d]|%s|END",
         // getpid(), got, buff);
       }
@@ -1036,7 +1093,7 @@ int32_t hydra_send(int32_t socket, char *buf, uint32_t size, int32_t options) {
 
   if (debug) {
     sprintf(text, "[DEBUG] SEND [pid:%d]", getpid());
-    hydra_dump_data(buf, size, text);
+    hydra_dump_data((unsigned char *)buf, size, text);
 
     /*    int32_t k;
         char *debugbuf = malloc(size + 1);
@@ -1073,14 +1130,39 @@ char *hydra_strrep(char *string, char *oldpiece, char *newpiece) {
   char *c, oldstring[6096],
       newstring[6096]; // updated due to issue 192 on github.
   static char finalstring[6096];
+  size_t old_l, new_l, in_l, match_count = 0;
 
-  if (string == NULL || oldpiece == NULL || newpiece == NULL || strlen(string) >= sizeof(oldstring) - 1 || (strlen(string) + strlen(newpiece) - strlen(oldpiece) >= sizeof(newstring) - 1 && strlen(string) > strlen(oldpiece)))
+  if (string == NULL || oldpiece == NULL || newpiece == NULL || strlen(string) >= sizeof(oldstring) - 1)
     return NULL;
+  /* An empty needle would make strstr always match without advancing str_index,
+   * looping forever and overflowing newstring. */
+  if (oldpiece[0] == 0)
+    return NULL;
+
+  /* The original guard only modelled a single substitution. With many
+   * occurrences and new_len > old_len, the cumulative growth can far exceed
+   * the buffer; count matches up front and refuse if the result would not fit. */
+  in_l = strlen(string);
+  old_l = strlen(oldpiece);
+  new_l = strlen(newpiece);
+  {
+    char *p = string;
+    while ((p = strstr(p, oldpiece)) != NULL) {
+      match_count++;
+      p += old_l;
+    }
+  }
+  if (new_l > old_l) {
+    size_t growth_per = new_l - old_l;
+    if (match_count > (sizeof(newstring) - 1 - in_l) / (growth_per ? growth_per : 1))
+      return NULL;
+  }
 
   if (strlen(string) > 6000) {
     hydra_report(stderr, "[ERROR] Supplied URL or POST data too large. Max "
                          "limit is 6000 characters.\n");
-    exit(-1);
+    /* hydra_child_exit so the parent records the error in its accounting. */
+    hydra_child_exit(2);
   }
 
   strcpy(newstring, string);
@@ -1155,7 +1237,8 @@ void hydra_tobase64(unsigned char *buf, uint32_t buflen, uint32_t bufsize) {
     big[2] = hydra_conv64(((*(ptr + 1) & 15) << 2) + (*(ptr + 2) >> 6));
     big[3] = hydra_conv64(*(ptr + 2) & 63);
     len += strlen((char *)big);
-    if (len > bufsize) {
+    /* Reserve room for the trailing NUL strcat appends. */
+    if (len + 1 > bufsize) {
       buf[0] = 0;
       return;
     }
@@ -1177,6 +1260,10 @@ void hydra_tobase64(unsigned char *buf, uint32_t buflen, uint32_t bufsize) {
     if (small[1] == 0)
       big[2] = '=';
     big[3] = '=';
+    if (len + strlen((char *)big) + 1 > bufsize) {
+      buf[0] = 0;
+      return;
+    }
     strcat((char *)bof, (char *)big);
   }
 
@@ -1299,12 +1386,20 @@ int32_t hydra_string_match(char *str, const char *regex) {
 
   re = pcre2_compile(regex, PCRE2_ZERO_TERMINATED, PCRE2_CASELESS | PCRE2_DOTALL, &error_code, &error_offset, NULL);
   if (re == NULL) {
-    fprintf(stderr, "[ERROR] PCRE compilation failed at offset %d: %d\n", error_offset, error_code);
+    fprintf(stderr, "[ERROR] PCRE compilation failed at offset %d: %d\n", (int)error_offset, (int)error_code);
     return 0;
   }
 
   pcre2_match_data *match_data = pcre2_match_data_create_from_pattern(re, NULL);
-  rc = pcre2_match(re, str, PCRE2_ZERO_TERMINATED, 0, 0, match_data, NULL);
+  /* cap match steps so a catastrophic-backtracking pattern against an
+   * attacker-supplied body cannot peg the worker's CPU. */
+  pcre2_match_context *mctx = pcre2_match_context_create(NULL);
+  if (mctx != NULL) {
+    pcre2_set_match_limit(mctx, 100000);
+    pcre2_set_depth_limit(mctx, 1000);
+  }
+  rc = pcre2_match(re, str, PCRE2_ZERO_TERMINATED, 0, 0, match_data, mctx);
+  if (mctx != NULL) pcre2_match_context_free(mctx);
   pcre2_match_data_free(match_data);
   pcre2_code_free(re);
 

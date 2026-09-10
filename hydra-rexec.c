@@ -4,7 +4,7 @@
 
 #define COMMAND "/bin/ls /"
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 
 int32_t start_rexec(int32_t s, char *ip, int32_t port, unsigned char options, char *miscptr, FILE *fp) {
   char *empty = "";
@@ -17,6 +17,10 @@ int32_t start_rexec(int32_t s, char *ip, int32_t port, unsigned char options, ch
     pass = empty;
 
   memset(buffer2, 0, sizeof(buffer2));
+  if (1 + strlen(login) + 1 + strlen(pass) + 1 + strlen(COMMAND) + 1 > sizeof(buffer2)) {
+    hydra_completed_pair_skip();
+    return 1;
+  }
   bptr++;
 
   strcpy(bptr, login);

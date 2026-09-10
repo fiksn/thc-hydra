@@ -1,6 +1,6 @@
 #include "hydra-mod.h"
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 char *buf;
 
 int32_t start_redis(int32_t s, char *ip, int32_t port, unsigned char options, char *miscptr, FILE *fp) {
@@ -24,6 +24,11 @@ int32_t start_redis(int32_t s, char *ip, int32_t port, unsigned char options, ch
     return 1;
   }
   buf = hydra_receive_line(s);
+  if (buf == NULL) {
+    hydra_report(stderr, "[ERROR] Failed to receive response from Redis server.\n");
+    return 3;
+  }
+
   if (buf[0] == '+') {
     hydra_report_found_host(port, ip, "redis", fp);
     hydra_completed_pair_found();
@@ -165,6 +170,8 @@ int32_t service_redis_init(char *ip, int32_t sp, unsigned char options, char *mi
     return 2;
   }
   buf = hydra_receive_line(sock);
+  if (buf == NULL)
+    return 2;
   if (debug)
     printf("[DEBUG] buf = %s\n", buf);
   // authentication test

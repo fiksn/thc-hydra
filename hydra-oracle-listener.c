@@ -20,7 +20,7 @@ void dummy_oracle_listener() { printf("\n"); }
 #define HASHSIZE 17
 
 extern hydra_option hydra_options;
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 char *buf;
 unsigned char *hash;
 int32_t sid_mechanism = AUTH_PLAIN;
@@ -141,7 +141,11 @@ int32_t ora_hash_password(char *pass) {
   int32_t siz = 0;
   unsigned char *desresult;
   unsigned char *result;
-  char buff[strlen(pass) + 5];
+  /* fixed-size: VLAs interact poorly with stack canaries. MAXLINESIZE = 256. */
+  char buff[261];
+
+  if (strlen(pass) + 4 >= sizeof(buff))
+    return -1;
 
   memset(buff, 0, sizeof(buff));
 

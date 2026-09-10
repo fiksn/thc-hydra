@@ -12,7 +12,7 @@ typedef struct pool_str {
   struct pool_str *next;
 } pool;
 
-extern char *HYDRA_EXIT;
+extern const unsigned char HYDRA_EXIT[5];
 char *buf;
 char apop_challenge[300] = "";
 pool *plist = NULL, *p = NULL;
@@ -105,11 +105,10 @@ char *pop3_read_server_capacity(int32_t sock) {
           buf = hydra_receive_line(sock);
         }
       } else {
-        if (buf[strlen(buf) - 1] == '\n')
-          buf[strlen(buf) - 1] = 0;
-        if (buf[strlen(buf) - 1] == '\r')
-          buf[strlen(buf) - 1] = 0;
-        if (*(ptr) == '.' || *(ptr) == '-')
+        size_t blen = strlen(buf);
+        while (blen > 0 && (buf[blen - 1] == '\n' || buf[blen - 1] == '\r'))
+          buf[--blen] = 0;
+        if (blen > 0 && (buf[blen - 1] == '.' || *(ptr) == '.' || *(ptr) == '-'))
           resp = 1;
       }
     }
@@ -258,7 +257,11 @@ int32_t start_pop3(int32_t s, char *ip, int32_t port, unsigned char options, cha
     }
 
     memset(buffer, 0, sizeof(buffer));
-    from64tobits((char *)buffer, buf + 2);
+    if (from64tobits_n((char *)buffer, buf + 2, sizeof(buffer)) < 0) {
+      hydra_report(stderr, "[ERROR] POP3 CRAM-* AUTH: oversized challenge\n");
+      free(buf);
+      return 3;
+    }
     free(buf);
 
     memset(buffer2, 0, sizeof(buffer2));
@@ -305,7 +308,11 @@ int32_t start_pop3(int32_t s, char *ip, int32_t port, unsigned char options, cha
       return 3;
     }
     memset(buffer, 0, sizeof(buffer));
-    from64tobits((char *)buffer, buf);
+    if (from64tobits_n((char *)buffer, buf, sizeof(buffer)) < 0) {
+      hydra_report(stderr, "[ERROR] POP3 DIGEST-MD5 AUTH: oversized challenge\n");
+      free(buf);
+      return 3;
+    }
     free(buf);
 
     if (debug)
@@ -349,17 +356,31 @@ int32_t start_pop3(int32_t s, char *ip, int32_t port, unsigned char options, cha
     sprintf(buffer, "%s\r\n", buf1);
     if (hydra_send(s, buffer, strlen(buffer), 0) < 0)
       return 1;
-    if ((buf = hydra_receive_line(s)) == NULL || strlen(buf) < 6)
+    if ((buf = hydra_receive_line(s)) == NULL)
       return 4;
+    if (strlen(buf) < 6) {
+      free(buf);
+      return 4;
+    }
 
     // recover challenge
-    from64tobits((char *)buf1, buf + 2);
+    if (from64tobits_n((char *)buf1, buf + 2, sizeof(buf1)) < 0) {
+      hydra_report(stderr, "[ERROR] POP3 NTLM AUTH: oversized challenge\n");
+      free(buf);
+      return 3;
+    }
     free(buf);
 
     // Send response
     buildAuthResponse((tSmbNtlmAuthChallenge *)buf1, (tSmbNtlmAuthResponse *)buf2, 0, login, pass, NULL, NULL);
     to64frombits(buf1, buf2, SmbLength((tSmbNtlmAuthResponse *)buf2));
 
+    /* The Type-3 base64 response embeds a server-controlled domain string and
+     * can exceed `buffer` for a malicious server. Refuse rather than overflow. */
+    if (strlen((char *)buf1) + 2 >= sizeof(buffer)) {
+      hydra_report(stderr, "[ERROR] POP3 NTLM AUTH: oversized response\n");
+      return 3;
+    }
     sprintf(buffer, "%s\r\n", buf1);
   } break;
   default:
@@ -462,7 +483,7 @@ void service_pop3(char *ip, int32_t sp, unsigned char options, char *miscptr, FI
           ptr[strlen(ptr) - 1] = 0;
         if (ptr[strlen(ptr) - 1] == '\r')
           ptr[strlen(ptr) - 1] = 0;
-        strcpy(apop_challenge, ptr);
+        snprintf(apop_challenge, sizeof(apop_challenge), "%s", ptr);
       }
       free(buf);
 
@@ -472,7 +493,7 @@ void service_pop3(char *ip, int32_t sp, unsigned char options, char *miscptr, FI
          * auth methods */
         hydra_send(sock, "STLS\r\n", strlen("STLS\r\n"), 0);
         buf = hydra_receive_line(sock);
-        if (buf[0] != '+') {
+        if (buf == NULL || buf[0] != '+') {
           hydra_report(stderr, "[ERROR] TLS negotiation failed, no answer "
                                "received from STARTTLS request\n");
         } else {
@@ -552,7 +573,7 @@ int32_t service_pop3_init(char *ip, int32_t sp, unsigned char options, char *mis
       ptr[strlen(ptr) - 1] = 0;
     if (ptr[strlen(ptr) - 1] == '\r')
       ptr[strlen(ptr) - 1] = 0;
-    strcpy(apop_challenge, ptr);
+    snprintf(apop_challenge, sizeof(apop_challenge), "%s", ptr);
   }
   free(buf);
 
@@ -589,7 +610,7 @@ int32_t service_pop3_init(char *ip, int32_t sp, unsigned char options, char *mis
       hydra_send(sock, "STLS\r\n", strlen("STLS\r\n"), 0);
       free(buf);
       buf = hydra_receive_line(sock);
-      if (buf[0] != '+') {
+      if (buf == NULL || buf[0] != '+') {
         hydra_report(stderr, "[ERROR] TLS negotiation failed, no answer "
                              "received from STARTTLS request\n");
       } else {
